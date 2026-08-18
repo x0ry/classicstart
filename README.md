@@ -3,6 +3,8 @@
 A lightweight, classic-style Start menu replacement for Windows — a single
 self-contained C++ source file, no runtime dependencies beyond the OS.
 
+![ClassicStart](screenshot.png)
+
 ## Features
 
 - Classic single-column Start menu: This PC, Programs, Documents, Downloads,
