@@ -4,8 +4,8 @@
 *.pdb
 *.ilk
 
-# Runtime config (ClassicStart writes this with defaults on first launch)
-classicstart.ini
+# Runtime config (ClassicShell writes this with defaults on first launch)
+classicshell.ini
 
 # Local editor/tooling state
 .claude/
