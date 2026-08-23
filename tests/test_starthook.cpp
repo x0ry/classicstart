@@ -1,8 +1,8 @@
 // Tests for starthook.h — the logic that decides when ClassicShell's own
 // Start menu should intercept a physical Windows-key tap or a taskbar
-// Start-button click, instead of letting the OS's native Start menu handle
-// it. This is the first bug/test pair for the project: regressions here
-// mean either menu stops popping up, or both do.
+// Start-button click, instead of letting the OS's native Start menu
+// handle it. This is the first bug/test pair for the project: regressions
+// here mean either menu stops popping up, or both do.
 #include "mini_test.h"
 #include "../starthook.h"
 
@@ -153,4 +153,69 @@ TEST(ClickAboveTaskbar_Misses)
         32);
 
     CHECK(!hit);
+}
+
+// ------------------------------------------------------------------
+// StartButtonMouseTracker
+// ------------------------------------------------------------------
+
+TEST(DownOnButton_UpSwallowsBoth)
+{
+    StartButtonMouseTracker tracker;
+
+    bool downConsumed = tracker.OnLeftButtonDown(true);
+    bool upConsumed = tracker.OnLeftButtonUp();
+
+    CHECK(downConsumed);
+    CHECK(upConsumed);
+}
+
+TEST(DownOffButton_UpSwallowsNeither)
+{
+    StartButtonMouseTracker tracker;
+
+    bool downConsumed = tracker.OnLeftButtonDown(false);
+    bool upConsumed = tracker.OnLeftButtonUp();
+
+    CHECK(!downConsumed);
+    CHECK(!upConsumed);
+}
+
+TEST(DownOnButtonThenDragOff_UpStillSwallowed)
+{
+    // The up must be swallowed based on where the down landed, not
+    // where the cursor happens to be when the button is released —
+    // otherwise a press-then-drag-off leaks a stray up to whatever is
+    // now under the cursor.
+    StartButtonMouseTracker tracker;
+
+    tracker.OnLeftButtonDown(true);
+
+    // Simulate the cursor having moved elsewhere before release: the
+    // tracker takes no positional input on OnLeftButtonUp, so there's
+    // nothing to feed it here, but the symmetry itself is the assertion.
+    bool upConsumed = tracker.OnLeftButtonUp();
+
+    CHECK(upConsumed);
+}
+
+TEST(RepeatedClicks_EachCycleIndependent)
+{
+    StartButtonMouseTracker tracker;
+
+    for (int i = 0; i < 3; ++i)
+    {
+        CHECK(tracker.OnLeftButtonDown(true));
+        CHECK(tracker.OnLeftButtonUp());
+    }
+
+    CHECK(!tracker.OnLeftButtonDown(false));
+    CHECK(!tracker.OnLeftButtonUp());
+}
+
+TEST(UpWithoutPriorDown_DoesNotSwallow)
+{
+    StartButtonMouseTracker tracker;
+
+    CHECK(!tracker.OnLeftButtonUp());
 }

@@ -5,41 +5,26 @@ self-contained C++ source file, no runtime dependencies beyond the OS.
 
 ![ClassicShell](screenshot.png)
 
+> This is a rebuild in progress. It was reset to the last known-good
+> commit after a keyboard-hook regression in a since-discarded version
+> made the Windows key get permanently stuck, forcing a reboot to
+> recover. See [SPEC.md](SPEC.md) for the full intended feature set, the
+> correctness rules this rebuild is held to, and the incident writeup
+> explaining exactly what went wrong and why. Features listed below are
+> what's actually implemented right now, not the eventual target.
+
 ## Features
 
 - Classic single-column Start menu: This PC, Programs, Documents, Downloads,
-  Pictures, Music, Videos, Games, Control Panel, and Run, each with real
-  Windows-accurate icons — Games resolves to whatever actually has games in
-  it on your system, falling back through a couple of locations rather than
-  assuming one exact folder exists.
+  Pictures, Music, Control Panel, and Run, each with real Windows-accurate
+  icons.
 - A search/Run box that resolves typed commands, known folders, and
   installed apps (including packaged/Store apps).
-- Wildcard file search: ClassicShell indexes a folder in the background at
-  startup, and typing a pattern like `*.txt` or `report.*` — or just plain
-  text, matched as a contains-search — pops open a translucent panel
-  beside the menu with matching files to arrow through and launch — the
-  main menu's own layout never shifts to make room for it.
-- Hover preview: resting the mouse on a text/plaintext, JSON/XML, or image
-  (PNG, JPEG, GIF, BMP, ICO, TIFF, or SVG — vector-rendered at exact
-  preview resolution, with true alpha transparency) search result pops a
-  quick-look panel in the screen's opposite corner. The text/JSON/XML panel
-  sizes itself to the actual content — measuring the widest line and total
-  line count against the panel's own font, then clamping to a readable-but-
-  not-huge range — instead of always claiming a fixed fraction of the
-  screen; the image panel scales so it reads at roughly a quarter of the
-  screen regardless of its native resolution. Moving the mouse into the
-  panel keeps it open and lets the wheel scroll a text preview; losing
-  hover elsewhere fades it out on a short delay instead of snapping shut.
 - Power flyout with Restart, Shut down, Sign out, and Lock, each with a
   hover label.
 - Up to 3 configurable quick-launch buttons.
 - Live opacity slider, acrylic blur, rounded corners, and the real Windows
-  accent color — all anti-aliased. The slider isn't limited to the Start
-  menu itself: hover it and scroll to cycle its target through every other
-  real window on the desktop (an accent-colored outline follows along to
-  show which one), letting you drag the same slider to adjust any other
-  app's transparency. Scroll back down to return to the Start menu; closing
-  the menu always hands a targeted window's opacity back exactly as found.
+  accent color — all anti-aliased.
 - Renders in Segoe UI Variable and Segoe Fluent Icons — the same fonts
   Windows 11's own Start menu and Settings app use — falling back to
   classic Segoe UI / Segoe MDL2 Assets on older Windows versions that
@@ -47,27 +32,41 @@ self-contained C++ source file, no runtime dependencies beyond the OS.
 - Full keyboard navigation (Tab / Shift+Tab / arrows) with a visible focus
   ring, and Ctrl+Esc to open.
 - Single-instance: launching it again cleanly replaces any running copy.
-- Tapping the Windows key alone opens the menu, the same as the native
-  Start Menu — and only ours; clicking the taskbar Start button does
-  the same. Win+key combos (Win+D, Win+E, ...) pass both the key-down
-  and key-up straight through untouched, exactly like the OS would see
-  them without ClassicShell running at all. A completed standalone tap
-  is different: its physical key-up is eaten rather than forwarded, so
-  the native Start menu never sees the real release it needs to open —
-  confirmed against real physical key presses, not just simulated
-  input, since a same-process `SendInput` can't reliably stand in for
-  what the OS's own native tap-detection actually reacts to. Eating a
-  real key-up isn't free: with nothing to replace it, Windows is left
-  believing the key is still held, turning every following keystroke
-  into a phantom Win+key shortcut. The fix is a synthetic replacement
-  key-up sent ~700ms later from a background thread, not immediately —
-  sent immediately, it retriggers the very native menu it's meant to
-  suppress (whatever's watching the release doesn't appear to
-  discriminate real input from injected), but by ~700ms out, the
-  native tap-detector's own eligibility window has apparently already
-  closed, so the late arrival clears Windows' key-state tracking
-  unnoticed. See `tests/wintap_experiment.cpp` for the standalone
-  harness this was worked out with.
+- Left-clicking the taskbar Start button hijacks into ClassicShell's own
+  menu — this is the primary way to open it, and works out of the box.
+  Right-click and middle-click on the button are untouched. Win+key combos
+  (Win+D, Win+E, ...) always reach their normal native targets untouched.
+- Tapping the Windows key alone does **not** open ClassicShell's menu by
+  default — the tap is only ever observed, so the normal legacy/native
+  Start menu opens instead, letting you keep using it alongside
+  ClassicShell. Set `CaptureWinKey=1` under `[Experimental]` in
+  `classicshell.ini` to have a standalone Win tap open ClassicShell's menu
+  instead (see Configuration below) — off by default while this gets
+  hardened over time.
+
+  **How the Windows-key handling actually works, and why:** unlike some
+  alternative shells (including a previous version of this one), the
+  physical Windows-key down and up are never intercepted — they always
+  pass straight through to `CallNextHookEx`, unconditionally, every
+  time, whether or not `CaptureWinKey` is on. A live hook that swallows a
+  key-up without the OS ever seeing a matching release leaves Windows' own
+  key-state table believing that key is still held down, which turns every
+  following keystroke into a phantom Win+key shortcut until a reboot clears
+  it — this exact failure is what took down a previous version (see
+  SPEC.md's incident section). Because the tap is only *observed*, not
+  blocked, enabling `CaptureWinKey` means the native Start menu (or, on
+  some Windows configurations, Search) can genuinely flash open for a
+  frame before this app's own menu takes over. Rather than trying to
+  prevent that, a `SetWinEventHook` watches for exactly that surface
+  becoming foreground and immediately dismisses it with a synthetic
+  Escape, handing focus back to this app's own window — a dismiss-after
+  instead of a prevent-before. See `tests/wintap_experiment.cpp` for the
+  standalone harness this history was worked out with, including the
+  earlier (rejected) approaches.
+
+  The taskbar-button click uses the same discipline on the mouse side: the
+  physical down/up over the button are swallowed as a matched pair (never
+  one without the other), so it can't regress into the same class of bug.
 
 ## Building
 
@@ -84,7 +83,7 @@ required at build time.
 ## Testing
 
 `starthook.h` holds the logic behind ClassicShell's interception of the
-physical Windows key and the taskbar Start button — kept free of
+physical Windows key and the taskbar Start-button click — kept free of
 `SetWindowsHookEx`/`CallNextHookEx` plumbing so it runs the same in the
 shipped app and in a plain console test binary. `classicshell.cpp`'s
 keyboard and mouse hooks are thin wrappers around it.
@@ -106,7 +105,11 @@ confirm or rule a theory out, since simulated input can't stand in
 for what the OS's own native tap-detection reacts to. Compile and run
 it directly (see the comment at the top of the file for the exact
 `cl.exe` invocation and how modes are selected) before changing this
-behavior again.
+behavior again — and, per SPEC.md section 2.3, any change to the real
+keyboard/mouse hooks still needs an actual physical Windows-key tap, an
+actual physical Ctrl+Esc, and an actual physical click on the taskbar
+Start button (including a press-then-drag-off) tried against the built
+app before it's called done, not just a passing test suite.
 
 ## Configuration
 
@@ -132,19 +135,19 @@ Documents=1       ; the menu. Set any to 0 to hide that row. If
 Downloads=1       ; every item ends up disabled, all of them show
 Pictures=1        ; anyway rather than leaving an empty menu.
 Music=1
-Videos=1
-Games=1
 ControlPanel=1
 Run=1
 
-[Search]
-IndexPath=C:\Users\you  ; folder indexed in the background for wildcard
-                        ; search; defaults to your profile folder
+[Experimental]
+CaptureWinKey=0   ; 0 = Windows-key tap opens the native/legacy Start
+                  ; menu (default). 1 = a tap opens ClassicShell's own
+                  ; menu instead. The taskbar Start button and Ctrl+Esc
+                  ; always open ClassicShell's menu either way.
 ```
 
-`Scale`, `StartOpacity`, `MenuItems`, and `Search` apply the next time the
-app launches. `QuickTools` entries refresh live, every time the menu is
-opened.
+`Scale`, `StartOpacity`, `MenuItems`, and `CaptureWinKey` apply the next
+time the app launches. `QuickTools` entries refresh live, every time the
+menu is opened.
 
 ## License
 

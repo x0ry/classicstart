@@ -3,8 +3,9 @@
 //
 // This is deliberately kept free of SetWindowsHookEx/CallNextHookEx and any
 // other live-hook plumbing, so it can run the same in the shipped app and in
-// a plain console unit test: WinKeyTracker only tracks up/down state and
-// hands back a decision, and IsStartButtonHit only does rectangle math.
+// a plain console unit test: WinKeyTracker and StartButtonMouseTracker only
+// track state and hand back a decision, and IsStartButtonHit only does
+// rectangle math.
 #pragma once
 
 #include <windows.h>
@@ -140,3 +141,46 @@ inline bool IsStartButtonHit(
 
     return PtInRect(&centered, point) != FALSE;
 }
+
+// ============================================================
+// Taskbar Start-button mouse-hook swallow tracking
+// ============================================================
+
+// Guarantees a taskbar Start-button click is swallowed symmetrically: if
+// the physical WM_LBUTTONDOWN over the button is eaten (not forwarded via
+// CallNextHookEx) to fire our own toggle, the matching physical
+// WM_LBUTTONUP must also be eaten, unconditionally, regardless of where the
+// cursor ends up by the time it's released. An asymmetric swallow here is
+// the same class of bug that caused the Windows-key incident (see
+// SPEC.md 2.1) — just for a mouse button instead of a modifier key — so
+// this class exists to make that structurally impossible rather than
+// relying on it happening to be harmless.
+class StartButtonMouseTracker
+{
+public:
+    // Called on a real (non-injected) WM_LBUTTONDOWN. hitStartButton is
+    // the result of hit-testing this press against the Start button's
+    // rect. Returns true iff the hook should swallow this down (and act
+    // on it); the same value is remembered so the matching up is handled
+    // consistently.
+    bool OnLeftButtonDown(bool hitStartButton)
+    {
+        m_capturingUp = hitStartButton;
+        return hitStartButton;
+    }
+
+    // Called on a real (non-injected) WM_LBUTTONUP. Returns true iff this
+    // up must be swallowed to match a down that was swallowed above —
+    // regardless of the current cursor position, so a press-then-drag-off
+    // still releases cleanly instead of leaking a stray up to whatever is
+    // under the cursor now.
+    bool OnLeftButtonUp()
+    {
+        bool consume = m_capturingUp;
+        m_capturingUp = false;
+        return consume;
+    }
+
+private:
+    bool m_capturingUp = false;
+};
