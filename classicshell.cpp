@@ -7926,21 +7926,27 @@ static void ApplyAcrylicBlur(
             19;
 
     // GradientColor is 0xAABBGGRR. COLORREF is already 0x00BBGGRR, so
-    // only the alpha byte needs adding on top. The tint is sampled
+    // only the alpha byte needs adding on top. The base tint is sampled
     // directly from the real taskbar's own rendered pixels (see
-    // SampleTaskbarColor) rather than computed from theme/accent
-    // registry values, so it matches whatever the taskbar actually looks
-    // like right now — live wallpaper, accent, and lighting all included
-    // — instead of an approximation that can drift from it. Falls back
-    // to a panel/accent blend if the taskbar can't be sampled for any
-    // reason. This only changes what DWM blends *behind* the window, not
-    // any of this app's own opaque panel/text rendering, so it can't
-    // touch text legibility the way a base-palette change could.
+    // SampleTaskbarColor), so it matches the live wallpaper/lighting
+    // behind it — but the raw sampled pixels mostly show blurred
+    // wallpaper, not the user's chosen accent color (that only shows up
+    // there if "Show accent color on Start, taskbar" is on), so it's
+    // blended with the real accent color afterward to keep the tint
+    // clearly reading as *this theme's* highlight color rather than just
+    // whatever happened to be on screen. Falls back to a panel/accent
+    // blend if the taskbar can't be sampled at all. This only changes
+    // what DWM blends *behind* the window, not any of this app's own
+    // opaque panel/text rendering, so it can't touch text legibility the
+    // way a base-palette change could.
     COLORREF sampledTint =
-        SampleTaskbarColor(MixColor(g_panel, g_accent, 40));
+        SampleTaskbarColor(g_panel);
+
+    COLORREF finalTint =
+        MixColor(sampledTint, g_accent, 35);
 
     DWORD tint =
-        (DWORD)sampledTint &
+        (DWORD)finalTint &
         0x00FFFFFF;
 
     DWORD gradientColor =
