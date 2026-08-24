@@ -3503,6 +3503,44 @@ static void LaunchSearchResult(size_t index)
     CloseStart();
 }
 
+// Right-click on a search result: reveal it in Explorer instead of
+// launching it. A no-op for God Mode Control Panel items — there's no
+// real file/folder location to show for one of those.
+static void OpenSearchResultFolder(size_t index)
+{
+    if (index >= g_searchResults.size())
+        return;
+
+    const SearchResultEntry& entry = g_searchResults[index];
+
+    if (entry.kind != SearchResultKind::File)
+        return;
+
+    std::wstring path;
+
+    {
+        std::lock_guard<std::mutex> lock(g_fileIndexMutex);
+
+        if (entry.fileIndex < g_fileIndex.size())
+            path = g_fileIndex[entry.fileIndex].fullPath;
+    }
+
+    if (path.empty())
+        return;
+
+    std::wstring params = L"/select,\"" + path + L"\"";
+
+    ShellExecuteW(
+        nullptr, L"open", L"explorer.exe",
+        params.c_str(), nullptr, SW_SHOWNORMAL);
+
+    g_searchText.clear();
+    g_searchSelection.Reset();
+    ClearSearchResults();
+    RepositionSearchPanel();
+    CloseStart();
+}
+
 // The "Control Panel" menu row toggles a full listing of every God Mode
 // item into the results panel — a disclosure, not a launcher.
 static void ToggleControlPanelBrowse()
@@ -4333,6 +4371,17 @@ static LRESULT CALLBACK SearchPanelProc(
 
             if (row >= 0)
                 LaunchSearchResult((size_t)row);
+
+            return 0;
+        }
+
+        case WM_RBUTTONDOWN:
+        {
+            int y = GET_Y_LPARAM(lp);
+            int row = SearchResultRowFromPoint(y);
+
+            if (row >= 0)
+                OpenSearchResultFolder((size_t)row);
 
             return 0;
         }
@@ -6223,6 +6272,643 @@ static BYTE FractionToOpacity(
         t * (OPACITY_MAX - OPACITY_MIN));
 }
 
+// ============================================================
+// Opacity slider retargeting — hover the slider and scroll to cycle
+// through every other real window on the desktop (including the
+// taskbar), controlling that window's opacity instead of the Start
+// menu's own. Scrolling back down returns to index 0, the Start menu
+// itself. A toast in the opposite corner names the current target, and
+// an accent-colored outline follows it live.
+// ============================================================
+
+static const wchar_t TOAST_CLASS[] = L"ClassicShell.Toast";
+static HWND g_toast = nullptr;
+static std::wstring g_toastTitle;
+static std::wstring g_toastDetail;
+static float g_toastAlpha = 1.0f;
+static DWORD g_toastStartTick = 0;
+static UINT_PTR g_toastTimer = 0;
+static const UINT_PTR TIMER_TOAST = 8;
+static const BYTE TOAST_BASE_ALPHA = 235;
+static const int TOAST_HOLD_MS = 1400;
+static const int TOAST_FADE_MS = 300;
+
+static const wchar_t OPACITY_HIGHLIGHT_CLASS[] = L"ClassicShell.OpacityHighlight";
+static HWND g_opacityHighlight = nullptr;
+static HWND g_opacityHighlightTarget = nullptr;
+static UINT_PTR g_opacityTrackTimer = 0;
+static const UINT_PTR TIMER_OPACITY_TRACK = 9;
+
+static int g_opacityIndex = 0;
+static std::vector<HWND> g_opacityExternalWindows;
+static BYTE g_startOwnAlpha = START_WINDOW_ALPHA;
+static bool g_sliderHover = false;
+
+static RECT GetToastRect()
+{
+    RECT work{};
+
+    if (!GetWorkArea(work))
+        work = { 0, 0, 1920, 1080 };
+
+    int width = S(300);
+    int height = S(64);
+    int margin = S(8);
+
+    return
+    {
+        work.right - margin - width,
+        work.top + margin,
+        work.right - margin,
+        work.top + margin + height
+    };
+}
+
+static void PaintToast(
+    HWND hwnd,
+    HDC dc)
+{
+    RECT client{};
+    GetClientRect(hwnd, &client);
+
+    int width = client.right;
+    int height = client.bottom;
+
+    HDC back = CreateCompatibleDC(dc);
+
+    if (!back)
+        return;
+
+    HBITMAP bitmap = CreateCompatibleBitmap(dc, width, height);
+
+    if (!bitmap)
+    {
+        DeleteDC(back);
+        return;
+    }
+
+    HGDIOBJ old = SelectObject(back, bitmap);
+
+    FillRectColor(back, client, g_bg);
+    DrawRoundBorder(back, client, S(14), g_border);
+
+    DrawTextSimple(
+        back, g_toastTitle.c_str(),
+        S(14), S(8), width - S(28), S(24),
+        g_text, g_bold,
+        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    DrawTextSimple(
+        back, g_toastDetail.c_str(),
+        S(14), S(32), width - S(28), height - S(40),
+        g_muted, g_small,
+        DT_LEFT | DT_TOP | DT_WORDBREAK);
+
+    BitBlt(dc, 0, 0, width, height, back, 0, 0, SRCCOPY);
+
+    SelectObject(back, old);
+    DeleteObject(bitmap);
+    DeleteDC(back);
+}
+
+static LRESULT CALLBACK ToastProc(
+    HWND hwnd,
+    UINT msg,
+    WPARAM wp,
+    LPARAM lp)
+{
+    switch (msg)
+    {
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_PAINT:
+        {
+            PAINTSTRUCT ps{};
+            HDC dc = BeginPaint(hwnd, &ps);
+
+            if (dc)
+                PaintToast(hwnd, dc);
+
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+    }
+
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static bool CreateToastWindow(
+    HINSTANCE instance)
+{
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = ToastProc;
+    wc.hInstance = instance;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = TOAST_CLASS;
+
+    if (!RegisterClassExW(&wc) &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    {
+        return false;
+    }
+
+    g_toast =
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
+            TOAST_CLASS,
+            L"ClassicShell Toast",
+            WS_POPUP,
+            0, 0, 10, 10,
+            nullptr, nullptr, instance, nullptr);
+
+    if (!g_toast)
+        return false;
+
+    ApplyWindowRounding(g_toast);
+
+    return true;
+}
+
+// Pops (or replaces) the toast with a new message. Safe to call
+// repeatedly — each call just restarts the hold-then-fade clock.
+static void ShowToast(
+    const std::wstring& title,
+    const std::wstring& detail)
+{
+    if (!g_toast || !g_start)
+        return;
+
+    g_toastTitle = title;
+    g_toastDetail = detail;
+    g_toastAlpha = 1.0f;
+    g_toastStartTick = GetTickCount();
+
+    RECT r = GetToastRect();
+
+    SetWindowPos(
+        g_toast, HWND_TOPMOST,
+        r.left, r.top,
+        r.right - r.left, r.bottom - r.top,
+        SWP_SHOWWINDOW | SWP_NOACTIVATE);
+
+    SetLayeredWindowAttributes(g_toast, 0, TOAST_BASE_ALPHA, LWA_ALPHA);
+
+    InvalidateRect(g_toast, nullptr, FALSE);
+
+    if (g_toastTimer)
+        KillTimer(g_start, TIMER_TOAST);
+
+    g_toastTimer = SetTimer(g_start, TIMER_TOAST, 16, nullptr);
+}
+
+static void HideOpacityHighlight()
+{
+    if (g_opacityTrackTimer)
+    {
+        if (g_start)
+            KillTimer(g_start, TIMER_OPACITY_TRACK);
+
+        g_opacityTrackTimer = 0;
+    }
+
+    if (g_opacityHighlight)
+        ShowWindow(g_opacityHighlight, SW_HIDE);
+}
+
+// Stops actively tracking whichever window the slider was last pointed
+// at — hides the highlight border and stops re-polling its rect —
+// without touching its actual opacity at all.
+static void StopOpacityHighlight()
+{
+    g_opacityHighlightTarget = nullptr;
+    HideOpacityHighlight();
+}
+
+// Renders the border into a true per-pixel-alpha bitmap via
+// UpdateLayeredWindow rather than WM_PAINT + color-key: DWM's own corner
+// rounding (ApplyWindowRounding) clips with an anti-aliased mask, and a
+// color-keyed window has no real alpha for DWM to blend that mask
+// against, so the 1px stroke would come out faded right at the corners.
+static void RenderOpacityHighlight(
+    int width,
+    int height,
+    int screenX,
+    int screenY)
+{
+    if (!g_opacityHighlight || width <= 0 || height <= 0)
+        return;
+
+    // Premultiplied alpha — UpdateLayeredWindow's ULW_ALPHA blend
+    // (AC_SRC_ALPHA) requires it; straight (non-premultiplied) alpha
+    // here would show as a faint fringe around the anti-aliased edge of
+    // the stroke.
+    Gdiplus::Bitmap bitmap(width, height, PixelFormat32bppPARGB);
+
+    {
+        Gdiplus::Graphics graphics(&bitmap);
+
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+
+        Gdiplus::Pen pen(
+            Gdiplus::Color(
+                255, GetRValue(g_accent), GetGValue(g_accent), GetBValue(g_accent)),
+            2.0f);
+
+        graphics.DrawRectangle(
+            &pen, 1.0f, 1.0f, (float)(width - 2), (float)(height - 2));
+    }
+
+    Gdiplus::Rect fullRect(0, 0, width, height);
+    Gdiplus::BitmapData bmpData{};
+
+    if (bitmap.LockBits(
+            &fullRect, Gdiplus::ImageLockModeRead,
+            PixelFormat32bppPARGB, &bmpData) != Gdiplus::Ok)
+    {
+        return;
+    }
+
+    HDC screenDc = GetDC(nullptr);
+    HDC memDc = CreateCompatibleDC(screenDc);
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* dibBits = nullptr;
+    HBITMAP dib = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
+
+    if (dib && dibBits)
+    {
+        for (int y = 0; y < height; ++y)
+        {
+            memcpy(
+                (BYTE*)dibBits + (size_t)y * width * 4,
+                (BYTE*)bmpData.Scan0 + (size_t)y * bmpData.Stride,
+                (size_t)width * 4);
+        }
+
+        HGDIOBJ oldBitmap = SelectObject(memDc, dib);
+
+        POINT destPos{ screenX, screenY };
+        POINT srcPos{ 0, 0 };
+        SIZE sz{ width, height };
+
+        BLENDFUNCTION blend{};
+        blend.BlendOp = AC_SRC_OVER;
+        blend.SourceConstantAlpha = 255;
+        blend.AlphaFormat = AC_SRC_ALPHA;
+
+        UpdateLayeredWindow(
+            g_opacityHighlight, screenDc, &destPos, &sz,
+            memDc, &srcPos, 0, &blend, ULW_ALPHA);
+
+        SelectObject(memDc, oldBitmap);
+        DeleteObject(dib);
+    }
+
+    bitmap.UnlockBits(&bmpData);
+
+    DeleteDC(memDc);
+    ReleaseDC(nullptr, screenDc);
+}
+
+static void RepositionOpacityHighlight(
+    HWND target)
+{
+    if (!g_opacityHighlight || !target)
+        return;
+
+    RECT r{};
+
+    if (!GetWindowRect(target, &r))
+        return;
+
+    ShowWindow(g_opacityHighlight, SW_SHOWNOACTIVATE);
+
+    RenderOpacityHighlight(r.right - r.left, r.bottom - r.top, r.left, r.top);
+
+    SetWindowPos(
+        g_opacityHighlight, HWND_TOPMOST,
+        0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+// Shows the highlight for whatever's currently targeted without
+// changing what that is — defaults to the Start menu itself the first
+// time this runs in a given session. Pairs with HideOpacityHighlight(),
+// so hovering away and back always resumes on the same target.
+static void ResumeOpacityHighlight()
+{
+    if (!g_opacityHighlightTarget)
+        g_opacityHighlightTarget = g_start;
+
+    RepositionOpacityHighlight(g_opacityHighlightTarget);
+
+    if (g_start && !g_opacityTrackTimer)
+        g_opacityTrackTimer = SetTimer(g_start, TIMER_OPACITY_TRACK, 150, nullptr);
+}
+
+// Points the highlight at the Start menu itself — index 0. No
+// WS_EX_LAYERED/alpha bookkeeping needed unlike SetExternalOpacityTarget:
+// g_start is already layered, and its own opacity is handled by
+// ApplyOpacityToCurrentTarget's index==0 case.
+static void SetStartAsOpacityTarget()
+{
+    g_opacityHighlightTarget = g_start;
+    ResumeOpacityHighlight();
+}
+
+// Makes hwnd the slider's active external target: adds WS_EX_LAYERED if
+// it doesn't already have it (left in place afterward — undoing it on
+// every scroll-past would be needless churn on someone else's window),
+// reads its current opacity so the slider starts exactly where that
+// window already was, and moves the highlight border onto it.
+static void SetExternalOpacityTarget(
+    HWND hwnd)
+{
+    if (hwnd == g_opacityHighlightTarget)
+        return;
+
+    StopOpacityHighlight();
+
+    if (!hwnd)
+        return;
+
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    BYTE currentAlpha = 255;
+
+    if (ex & WS_EX_LAYERED)
+    {
+        BYTE a = 255;
+        DWORD flags = 0;
+        COLORREF key = 0;
+
+        if (GetLayeredWindowAttributes(hwnd, &key, &a, &flags) &&
+            (flags & LWA_ALPHA))
+        {
+            currentAlpha = a;
+        }
+    }
+    else
+    {
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+
+        SetWindowPos(
+            hwnd, nullptr, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+
+    g_opacityHighlightTarget = hwnd;
+    g_windowAlpha = currentAlpha;
+
+    SetLayeredWindowAttributes(hwnd, 0, g_windowAlpha, LWA_ALPHA);
+
+    RepositionOpacityHighlight(hwnd);
+
+    if (g_start && !g_opacityTrackTimer)
+        g_opacityTrackTimer = SetTimer(g_start, TIMER_OPACITY_TRACK, 150, nullptr);
+}
+
+// Same filtering an Alt-Tab-style window switcher uses: visible,
+// unowned, not a tool window, and not cloaked (a suspended UWP app or a
+// window parked on another virtual desktop). Unlike a plain Alt-Tab
+// list, the taskbar itself is deliberately included — see the taskbar
+// special-case in EnumOpacityCandidateProc below — since being able to
+// control its opacity was explicitly asked for.
+static const wchar_t* const OPACITY_EXCLUDED_CLASSES[] =
+{
+    L"Progman",
+    L"WorkerW",
+    L"Windows.UI.Core.CoreWindow",
+    L"DesktopWindowXamlSource",
+    L"tooltips_class32",
+    L"#32768",
+};
+
+static BOOL CALLBACK EnumOpacityCandidateProc(
+    HWND hwnd,
+    LPARAM lParam)
+{
+    auto* list = reinterpret_cast<std::vector<HWND>*>(lParam);
+
+    if (hwnd == g_start ||
+        hwnd == g_preview ||
+        hwnd == g_toast ||
+        hwnd == g_searchPanel ||
+        hwnd == g_opacityHighlight)
+    {
+        return TRUE;
+    }
+
+    DWORD ownerPid = 0;
+    GetWindowThreadProcessId(hwnd, &ownerPid);
+
+    if (ownerPid == GetCurrentProcessId())
+        return TRUE;
+
+    if (!IsWindowVisible(hwnd))
+        return TRUE;
+
+    // A minimized window's "position" is a meaningless off-screen
+    // sentinel — nothing sensible to frame with the highlight.
+    if (IsIconic(hwnd))
+        return TRUE;
+
+    wchar_t className[64]{};
+
+    GetClassNameW(hwnd, className, (int)(sizeof(className) / sizeof(className[0])));
+
+    bool isTaskbar =
+        _wcsicmp(className, L"Shell_TrayWnd") == 0 ||
+        _wcsicmp(className, L"Shell_SecondaryTrayWnd") == 0;
+
+    if (!isTaskbar)
+    {
+        if (GetWindow(hwnd, GW_OWNER) != nullptr)
+            return TRUE;
+
+        LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+
+        if (ex & WS_EX_TOOLWINDOW)
+            return TRUE;
+
+        if (GetWindowTextLengthW(hwnd) == 0)
+            return TRUE;
+
+        for (const wchar_t* excluded : OPACITY_EXCLUDED_CLASSES)
+        {
+            if (_wcsicmp(className, excluded) == 0)
+                return TRUE;
+        }
+
+        BOOL cloaked = FALSE;
+
+        DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+
+        if (cloaked)
+            return TRUE;
+    }
+
+    RECT r{};
+
+    if (!GetWindowRect(hwnd, &r) || r.right <= r.left || r.bottom <= r.top)
+        return TRUE;
+
+    list->push_back(hwnd);
+
+    return TRUE;
+}
+
+static void RefreshOpacityCandidates()
+{
+    g_opacityExternalWindows.clear();
+
+    EnumWindows(
+        EnumOpacityCandidateProc,
+        reinterpret_cast<LPARAM>(&g_opacityExternalWindows));
+}
+
+// Display name for the toast: real windows use their own title; the
+// taskbar has none, so it gets a synthetic, human-readable label.
+static std::wstring OpacityTargetDisplayName(
+    HWND hwnd)
+{
+    wchar_t className[64]{};
+
+    GetClassNameW(hwnd, className, (int)(sizeof(className) / sizeof(className[0])));
+
+    if (_wcsicmp(className, L"Shell_TrayWnd") == 0)
+        return L"Taskbar";
+
+    if (_wcsicmp(className, L"Shell_SecondaryTrayWnd") == 0)
+        return L"Taskbar (other monitor)";
+
+    wchar_t caption[256]{};
+
+    GetWindowTextW(hwnd, caption, (int)(sizeof(caption) / sizeof(caption[0])));
+
+    return caption[0] ? caption : L"(untitled window)";
+}
+
+// Moves the slider's target by one step in either direction — called
+// once per wheel notch while hovering the slider. The candidate list is
+// (re)built fresh the moment it's first needed scrolling up from index
+// 0, rather than kept constantly up to date, so it's never stale by
+// more than the current scroll session.
+static void CycleOpacityTarget(
+    int direction)
+{
+    if (g_opacityIndex == 0 && direction > 0)
+        RefreshOpacityCandidates();
+
+    int maxIndex = (int)g_opacityExternalWindows.size();
+    int newIndex = g_opacityIndex + direction;
+
+    if (newIndex < 0) newIndex = 0;
+    if (newIndex > maxIndex) newIndex = maxIndex;
+
+    // A candidate can vanish between being listed and being scrolled to
+    // (closed, or otherwise stopped existing) — skip past any dead ones
+    // in the same direction rather than landing on a dangling handle.
+    while (newIndex > 0 &&
+           newIndex <= maxIndex &&
+           !IsWindow(g_opacityExternalWindows[newIndex - 1]))
+    {
+        g_opacityExternalWindows.erase(g_opacityExternalWindows.begin() + (newIndex - 1));
+        maxIndex--;
+
+        if (newIndex > maxIndex)
+            newIndex = maxIndex;
+    }
+
+    if (newIndex == g_opacityIndex)
+        return;
+
+    g_opacityIndex = newIndex;
+
+    if (g_opacityIndex == 0)
+    {
+        g_windowAlpha = g_startOwnAlpha;
+
+        SetStartAsOpacityTarget();
+
+        ShowToast(
+            L"Start Menu",
+            L"Scroll to reach another window, or drag the slider to "
+            L"adjust this one.");
+    }
+    else
+    {
+        HWND target = g_opacityExternalWindows[g_opacityIndex - 1];
+
+        SetExternalOpacityTarget(target);
+
+        ShowToast(
+            OpacityTargetDisplayName(target),
+            L"Scroll to browse windows, or drag the slider to adjust "
+            L"this one's opacity.");
+    }
+
+    if (g_start)
+        InvalidateRect(g_start, nullptr, FALSE);
+}
+
+// Applies g_windowAlpha to whatever's currently targeted — the one
+// place both the mouse-drag and keyboard paths funnel through, so
+// dragging the slider or nudging it with the arrow keys behaves
+// identically regardless of which window is on the other end.
+static void ApplyOpacityToCurrentTarget()
+{
+    HWND target =
+        (g_opacityIndex > 0 && g_opacityHighlightTarget)
+            ? g_opacityHighlightTarget
+            : g_start;
+
+    if (target)
+        SetLayeredWindowAttributes(target, 0, g_windowAlpha, LWA_ALPHA);
+
+    if (g_opacityIndex == 0)
+        g_startOwnAlpha = g_windowAlpha;
+}
+
+static bool CreateOpacityHighlightWindow(
+    HINSTANCE instance)
+{
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = instance;
+    wc.lpszClassName = OPACITY_HIGHLIGHT_CLASS;
+
+    if (!RegisterClassExW(&wc) &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    {
+        return false;
+    }
+
+    g_opacityHighlight =
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED |
+                WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            OPACITY_HIGHLIGHT_CLASS,
+            L"ClassicShell Opacity Highlight",
+            WS_POPUP,
+            0, 0, 10, 10,
+            nullptr, nullptr, instance, nullptr);
+
+    return g_opacityHighlight != nullptr;
+}
+
 static void UpdateSliderFromX(
     HWND hwnd,
     int x)
@@ -6245,11 +6931,7 @@ static void UpdateSliderFromX(
     g_windowAlpha =
         FractionToOpacity(t);
 
-    SetLayeredWindowAttributes(
-        hwnd,
-        0,
-        g_windowAlpha,
-        LWA_ALPHA);
+    ApplyOpacityToCurrentTarget();
 
     InvalidateRect(
         hwnd,
@@ -6782,6 +7464,19 @@ static void CloseStart()
     g_hover = -1;
     g_powerHover = -1;
 
+    StopOpacityHighlight();
+
+    if (g_toast)
+    {
+        if (g_toastTimer)
+        {
+            KillTimer(g_start, TIMER_TOAST);
+            g_toastTimer = 0;
+        }
+
+        ShowWindow(g_toast, SW_HIDE);
+    }
+
     RepositionSearchPanel();
 }
 
@@ -7074,11 +7769,7 @@ static void AdjustFocusedSlider(
 
     g_windowAlpha = (BYTE)value;
 
-    SetLayeredWindowAttributes(
-        hwnd,
-        0,
-        g_windowAlpha,
-        LWA_ALPHA);
+    ApplyOpacityToCurrentTarget();
 
     InvalidateRect(
         hwnd,
@@ -8407,6 +9098,37 @@ static LRESULT CALLBACK StartProc(
                 PlaceSearchCaretFromPoint(hwnd, S(46), x, true);
             }
 
+            // Opacity slider hover — same inflated grab area as the
+            // drag hit-test, so hovering to scroll feels exactly as
+            // forgiving as hovering to drag.
+            {
+                RECT sliderForHover =
+                    GetOpacitySliderRect(
+                        client.right,
+                        client.bottom);
+
+                RECT sliderHoverHit =
+                {
+                    sliderForHover.left - S(4),
+                    sliderForHover.top - S(10),
+                    sliderForHover.right + S(4),
+                    sliderForHover.bottom + S(10)
+                };
+
+                bool nowHoveringSlider =
+                    PtInRect(&sliderHoverHit, point) == TRUE;
+
+                if (nowHoveringSlider != g_sliderHover)
+                {
+                    g_sliderHover = nowHoveringSlider;
+
+                    if (g_sliderHover)
+                        ResumeOpacityHighlight();
+                    else
+                        HideOpacityHighlight();
+                }
+            }
+
             int oldToolHover =
                 g_quickToolHover;
 
@@ -8485,12 +9207,55 @@ static LRESULT CALLBACK StartProc(
                 hwnd,
                 false);
 
+            if (g_sliderHover)
+            {
+                g_sliderHover = false;
+                HideOpacityHighlight();
+            }
+
             InvalidateRect(
                 hwnd,
                 nullptr,
                 FALSE);
 
             return 0;
+        }
+
+        case WM_MOUSEWHEEL:
+        {
+            // Wheel messages arrive with screen, not client, coordinates.
+            POINT screenPoint
+            {
+                (int)(short)LOWORD(lp),
+                (int)(short)HIWORD(lp)
+            };
+
+            ScreenToClient(hwnd, &screenPoint);
+
+            RECT client{};
+            GetClientRect(hwnd, &client);
+
+            RECT slider =
+                GetOpacitySliderRect(client.right, client.bottom);
+
+            RECT sliderHit =
+            {
+                slider.left - S(4),
+                slider.top - S(10),
+                slider.right + S(4),
+                slider.bottom + S(10)
+            };
+
+            if (PtInRect(&sliderHit, screenPoint))
+            {
+                int delta = (short)HIWORD(wp);
+
+                CycleOpacityTarget(delta > 0 ? 1 : -1);
+
+                return 0;
+            }
+
+            break;
         }
 
         case WM_LBUTTONDOWN:
@@ -9091,6 +9856,65 @@ static LRESULT CALLBACK StartProc(
                 return 0;
             }
 
+            if (wp == TIMER_OPACITY_TRACK)
+            {
+                if (!g_opacityHighlightTarget ||
+                    !IsWindow(g_opacityHighlightTarget) ||
+                    !IsWindowVisible(g_opacityHighlightTarget))
+                {
+                    // The targeted window closed, got hidden, or
+                    // minimized out from under us — fall back to the
+                    // Start menu rather than keep tracking a window
+                    // that's no longer really there.
+                    g_opacityIndex = 0;
+                    g_windowAlpha = g_startOwnAlpha;
+
+                    SetStartAsOpacityTarget();
+
+                    InvalidateRect(hwnd, nullptr, FALSE);
+
+                    return 0;
+                }
+
+                RepositionOpacityHighlight(g_opacityHighlightTarget);
+
+                return 0;
+            }
+
+            if (wp == TIMER_TOAST)
+            {
+                DWORD elapsed = GetTickCount() - g_toastStartTick;
+
+                if (elapsed < (DWORD)TOAST_HOLD_MS)
+                    return 0;
+
+                DWORD fadeElapsed = elapsed - TOAST_HOLD_MS;
+
+                if (fadeElapsed >= (DWORD)TOAST_FADE_MS)
+                {
+                    KillTimer(hwnd, TIMER_TOAST);
+                    g_toastTimer = 0;
+
+                    if (g_toast)
+                        ShowWindow(g_toast, SW_HIDE);
+
+                    return 0;
+                }
+
+                g_toastAlpha =
+                    1.0f - (float)fadeElapsed / (float)TOAST_FADE_MS;
+
+                if (g_toast)
+                {
+                    SetLayeredWindowAttributes(
+                        g_toast, 0,
+                        (BYTE)(TOAST_BASE_ALPHA * g_toastAlpha),
+                        LWA_ALPHA);
+                }
+
+                return 0;
+            }
+
             break;
         }
 
@@ -9226,6 +10050,13 @@ static void ShowStart()
         g_searchSelection.Reset();
         ClearSearchResults();
     }
+
+    // Every fresh open also starts back on index 0 (the Start menu
+    // itself) for the opacity slider, rather than resuming wherever a
+    // previous session left the scroll-to-retarget feature pointed.
+    g_opacityIndex = 0;
+    g_windowAlpha = g_startOwnAlpha;
+    g_opacityHighlightTarget = nullptr;
 
     RefreshSystemColors();
 
@@ -9452,12 +10283,31 @@ static const wchar_t* const NATIVE_SHELL_SURFACE_PROCESSES[] =
     L"ShellExperienceHost.exe"
 };
 
+// Originally just the native-Start/Search dismiss-after (SPEC.md 2.2);
+// widened to also close ClassicShell's own menu whenever *anything
+// else* becomes the foreground window while it's open — a real Control
+// Panel dialog opened from the God Mode listing, another app via
+// Alt+Tab, a taskbar button for a different running window, etc. Before
+// this, only a native shell surface or an explicit click/Escape closed
+// the menu, so it could be left open behind a newly-foregrounded window
+// with nothing telling it to go away — the same way a native flyout
+// menu dismisses whenever focus genuinely moves elsewhere.
 static void DismissNativeStartMenuIfNeeded(
     HWND foreground)
 {
     if (!g_startVisible ||
         !foreground ||
         !g_start)
+    {
+        return;
+    }
+
+    // Our own satellite windows (results panel, hover preview) are
+    // WS_EX_NOACTIVATE and never actually become the foreground window
+    // themselves, but checked anyway as a defensive no-op guard.
+    if (foreground == g_start ||
+        foreground == g_searchPanel ||
+        foreground == g_preview)
     {
         return;
     }
@@ -9476,24 +10326,27 @@ static void DismissNativeStartMenuIfNeeded(
         }
     }
 
-    if (!isNativeSurface)
+    if (isNativeSurface)
+    {
+        INPUT esc[2]{};
+
+        esc[0].type = INPUT_KEYBOARD;
+        esc[0].ki.wVk = VK_ESCAPE;
+
+        esc[1].type = INPUT_KEYBOARD;
+        esc[1].ki.wVk = VK_ESCAPE;
+        esc[1].ki.dwFlags = KEYEVENTF_KEYUP;
+
+        SendInput(
+            2,
+            esc,
+            sizeof(INPUT));
+
+        SetForegroundWindow(g_start);
         return;
+    }
 
-    INPUT esc[2]{};
-
-    esc[0].type = INPUT_KEYBOARD;
-    esc[0].ki.wVk = VK_ESCAPE;
-
-    esc[1].type = INPUT_KEYBOARD;
-    esc[1].ki.wVk = VK_ESCAPE;
-    esc[1].ki.dwFlags = KEYEVENTF_KEYUP;
-
-    SendInput(
-        2,
-        esc,
-        sizeof(INPUT));
-
-    SetForegroundWindow(g_start);
+    CloseStart();
 }
 
 static void CALLBACK ForegroundEventProc(
@@ -10033,6 +10886,8 @@ int WINAPI wWinMain(
     // before via HandleSearchEnter's ExecuteSmartInput fallback).
     CreateSearchPanelWindow(instance);
     CreatePreviewWindow(instance);
+    CreateToastWindow(instance);
+    CreateOpacityHighlightWindow(instance);
     StartBackgroundIndexing();
     StartGodModeIndexing();
 
@@ -10183,6 +11038,18 @@ int WINAPI wWinMain(
             g_preview);
 
         g_preview = nullptr;
+    }
+
+    if (g_toast)
+    {
+        DestroyWindow(g_toast);
+        g_toast = nullptr;
+    }
+
+    if (g_opacityHighlight)
+    {
+        DestroyWindow(g_opacityHighlight);
+        g_opacityHighlight = nullptr;
     }
 
     DestroyIcons();
