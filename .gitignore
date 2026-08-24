@@ -1,0 +1,12 @@
+# Build output (run build.bat to regenerate)
+*.exe
+*.obj
+*.pdb
+*.ilk
+
+# Runtime config (ClassicShell writes this with defaults on first launch)
+classicshell.ini
+
+# Local editor/tooling state
+.claude/
+.vs/
