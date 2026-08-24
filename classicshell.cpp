@@ -3086,6 +3086,7 @@ static void ShowPreviewForResult(int index);
 static void CancelPreviewFadeOut();
 static void BeginPreviewFadeOut();
 static void HidePreview();
+static void CancelPendingBlurClose();
 
 // Hover-preview state needed by the search panel's own WndProc (defined
 // below), even though the rest of the preview feature is implemented
@@ -3094,6 +3095,13 @@ static HWND g_preview = nullptr;
 static int g_previewHoverIndex = -1;
 static UINT_PTR g_previewShowTimer = 0;
 static const UINT_PTR TIMER_PREVIEW_HOVER = 5;
+
+// Grace-period state for DismissNativeStartMenuIfNeeded's blur-close
+// (declared here, not next to that function, since StartProc's WM_TIMER
+// handling — also defined earlier in the file than that function — needs
+// it too).
+static UINT_PTR g_blurCloseTimer = 0;
+static const UINT_PTR TIMER_BLUR_CLOSE = 10;
 
 // ============================================================
 // File search — background index + query matching
@@ -3453,7 +3461,7 @@ static void ClearSearchResults()
 // against a Control Panel task's name, so wildcard queries never match
 // God Mode items. No relevance scoring beyond that: first-match-wins, in
 // index order, up to MAX_SEARCH_RESULTS total.
-static void RefreshSearchResults()
+static void RefreshSearchResultsImpl()
 {
     ClearSearchResults();
 
@@ -3512,6 +3520,25 @@ static void RefreshSearchResults()
     }
 
     RepositionSearchPanel();
+}
+
+// Recomputes g_searchResults on every keystroke. Wrapped defensively for
+// the same reason ShowPreviewForResult is: MatchesSearchQuery and the
+// icon/file-index lookups it drives run against real filesystem content
+// this app doesn't control, on the hottest input path in the app — an
+// exception escaping here would crash the whole process on literally
+// every keystroke until the offending character was deleted.
+static void RefreshSearchResults()
+{
+    try
+    {
+        RefreshSearchResultsImpl();
+    }
+    catch (...)
+    {
+        ClearSearchResults();
+        RepositionSearchPanel();
+    }
 }
 
 static void LaunchSearchResult(size_t index)
@@ -4295,6 +4322,13 @@ static void PaintSearchPanel(
     FillRectColor(back, client, g_bg);
     DrawRoundBorder(back, client, S(18), g_border);
 
+    // Wrapped defensively for the same reason PaintPreview is: this
+    // touches loaded result data (display names, icons) on every
+    // repaint, and an exception escaping into the WM_PAINT dispatch
+    // would crash the whole process rather than just this one row.
+    try
+    {
+
     int keyboardFocusedIndex = GetFocusedSearchResultIndex();
 
     for (size_t i = 0; i < g_searchResults.size(); ++i)
@@ -4377,6 +4411,14 @@ static void PaintSearchPanel(
             g_searchScrollbarDragging
                 ? g_accent
                 : MixColor(g_bg, g_text, 35));
+    }
+
+    }
+    catch (...)
+    {
+        // Leave whatever was already drawn (the plain background/border)
+        // rather than trying to draw an error message with the same
+        // machinery that just failed.
     }
 
     BitBlt(dc, 0, 0, width, height, back, 0, 0, SRCCOPY);
@@ -5302,8 +5344,24 @@ namespace
             return false;
         }
 
+        // Deeply/pathologically nested JSON (thousands of levels of
+        // "[[[[...") would otherwise recurse once per level here and
+        // overflow the stack — a hard crash that a try/catch can't
+        // recover from, since a stack overflow isn't an ordinary C++
+        // exception. Bailing out past a generous depth (further than
+        // any real hand- or tool-authored JSON should ever need) turns
+        // that into the same graceful "fall back to raw text" path as
+        // any other parse failure.
+        static const int MAX_DEPTH = 64;
+
         bool ParseValue(std::wstring& out, int depth)
         {
+            if (depth > MAX_DEPTH)
+            {
+                ok = false;
+                return false;
+            }
+
             SkipWs();
 
             if (pos >= s.size())
@@ -6061,7 +6119,7 @@ static void HidePreview()
 // Loads and shows a hover preview for g_searchResults[index]. Not fatal
 // on any failure along the way — an unsupported/unreadable file just
 // means no preview appears, the search results themselves are unaffected.
-static void ShowPreviewForResult(int index)
+static void ShowPreviewForResultImpl(int index)
 {
     if (!g_preview)
         return;
@@ -6212,6 +6270,30 @@ static void ShowPreviewForResult(int index)
     InvalidateRect(g_preview, nullptr, FALSE);
 }
 
+// Loads and shows a hover preview for g_searchResults[index]. This is
+// the one place every risky per-file operation funnels through — text
+// loading, JSON/XML parsing, image/SVG decoding, all running against
+// content this app doesn't control the shape of. Any of that failing in
+// an ordinary way (bad_alloc, out_of_range, or anything else derived
+// from std::exception) is caught here and turned into "no preview
+// shown," rather than left to propagate out through the WM_TIMER
+// dispatch that calls this and crash the whole process — which, from
+// the user's side, looks identical to the Start menu itself closing.
+// (A stack overflow specifically can't be caught this way — see
+// JsonPrettyPrinter's own MAX_DEPTH guard for how that risk is
+// prevented instead, at the source, rather than recovered from here.)
+static void ShowPreviewForResult(int index)
+{
+    try
+    {
+        ShowPreviewForResultImpl(index);
+    }
+    catch (...)
+    {
+        HidePreview();
+    }
+}
+
 static void PaintPreview(
     HWND hwnd,
     HDC dc)
@@ -6240,6 +6322,16 @@ static void PaintPreview(
     FillRectColor(back, client, g_bg);
     DrawRoundBorder(back, client, S(18), g_border);
 
+    // Wrapped defensively: this walks loaded file content (text runs
+    // matched up against color spans, or a decoded image/SVG bitmap)
+    // every time the panel repaints, which is far more often than it's
+    // loaded — an exception escaping from here into the WM_PAINT
+    // dispatch would crash the whole process, indistinguishable from the
+    // user's side from the Start menu just closing. Falling back to the
+    // plain background/border already drawn above is a safe, visible
+    // "something went wrong showing this" rather than nothing at all.
+    try
+    {
     if (g_previewKind == PreviewKind::Image && g_previewImage)
     {
         Gdiplus::Graphics graphics(back);
@@ -6364,6 +6456,13 @@ static void PaintPreview(
                     ? g_accent
                     : MixColor(g_bg, g_text, 35));
         }
+    }
+    }
+    catch (...)
+    {
+        // Leave whatever was already drawn (the plain background/border)
+        // rather than trying to draw an error message with the same
+        // machinery that just failed.
     }
 
     BitBlt(dc, 0, 0, width, height, back, 0, 0, SRCCOPY);
@@ -8005,6 +8104,7 @@ static void CloseStart()
     g_hover = -1;
     g_powerHover = -1;
 
+    CancelPendingBlurClose();
     StopOpacityHighlight();
 
     if (g_toast)
@@ -10456,6 +10556,21 @@ static LRESULT CALLBACK StartProc(
                 return 0;
             }
 
+            if (wp == TIMER_BLUR_CLOSE)
+            {
+                // One-shot: the grace period has elapsed without the
+                // foreground reverting to one of our own windows (see
+                // DismissNativeStartMenuIfNeeded), so the menu really
+                // has lost focus to something else now.
+                KillTimer(hwnd, TIMER_BLUR_CLOSE);
+                g_blurCloseTimer = 0;
+
+                if (g_startVisible)
+                    CloseStart();
+
+                return 0;
+            }
+
             break;
         }
 
@@ -10824,6 +10939,34 @@ static const wchar_t* const NATIVE_SHELL_SURFACE_PROCESSES[] =
     L"ShellExperienceHost.exe"
 };
 
+// The search results panel and the hover preview sit in different
+// corners of the screen by design, so moving the mouse between them
+// crosses real desktop space in between — and on some systems (focus-
+// follows-mouse being the clearest case, but not the only one) that's
+// enough to make Windows transiently report some other window as the
+// foreground window, even though the user never actually clicked away
+// or switched apps. Rather than closing the menu the instant that
+// happens, a short grace period gives it a chance to self-correct (the
+// next foreground event reporting one of our own windows again, which
+// is exactly what happens once the cursor arrives at the preview/panel)
+// before actually closing — the same "grace window before acting on a
+// loss of hover" pattern the preview's own fade-out already uses.
+// (g_blurCloseTimer/TIMER_BLUR_CLOSE themselves are declared earlier in
+// the file, alongside the other satellite-window timer state, since
+// StartProc's WM_TIMER handling needs them too.)
+static const int BLUR_CLOSE_GRACE_MS = 400;
+
+static void CancelPendingBlurClose()
+{
+    if (g_blurCloseTimer)
+    {
+        if (g_start)
+            KillTimer(g_start, TIMER_BLUR_CLOSE);
+
+        g_blurCloseTimer = 0;
+    }
+}
+
 // Originally just the native-Start/Search dismiss-after (SPEC.md 2.2);
 // widened to also close ClassicShell's own menu whenever *anything
 // else* becomes the foreground window while it's open — a real Control
@@ -10832,7 +10975,8 @@ static const wchar_t* const NATIVE_SHELL_SURFACE_PROCESSES[] =
 // this, only a native shell surface or an explicit click/Escape closed
 // the menu, so it could be left open behind a newly-foregrounded window
 // with nothing telling it to go away — the same way a native flyout
-// menu dismisses whenever focus genuinely moves elsewhere.
+// menu dismisses whenever focus genuinely moves elsewhere. Doesn't close
+// immediately, though — see the grace-period note above.
 static void DismissNativeStartMenuIfNeeded(
     HWND foreground)
 {
@@ -10845,12 +10989,46 @@ static void DismissNativeStartMenuIfNeeded(
 
     // Our own satellite windows (results panel, hover preview) are
     // WS_EX_NOACTIVATE and never actually become the foreground window
-    // themselves, but checked anyway as a defensive no-op guard.
+    // themselves, but checked anyway as a defensive no-op guard. This is
+    // also the "self-correct" side of the grace period below: the cursor
+    // arriving at one of our own windows after a transient blip cancels
+    // whatever pending close that blip armed.
     if (foreground == g_start ||
         foreground == g_searchPanel ||
         foreground == g_preview)
     {
+        CancelPendingBlurClose();
         return;
+    }
+
+    // A NOACTIVATE window (the results panel, the preview) can't ever
+    // become foreground itself, but interacting with one — scrolling
+    // the results list with the mouse wheel, in particular — can make
+    // Windows briefly report the taskbar or the desktop as the
+    // foreground window instead, as a side effect of routing input near
+    // a window that isn't allowed to take activation. That's not a real
+    // "the user switched away" event the way a genuinely different app
+    // grabbing foreground is, so it's excluded here — a real click on
+    // the taskbar or desktop is already caught by MouseProc's own
+    // outside-click check regardless.
+    wchar_t foregroundClass[64]{};
+
+    GetClassNameW(
+        foreground, foregroundClass,
+        (int)(sizeof(foregroundClass) / sizeof(foregroundClass[0])));
+
+    static const wchar_t* const SHELL_CHROME_CLASSES[] =
+    {
+        L"Shell_TrayWnd",
+        L"Shell_SecondaryTrayWnd",
+        L"Progman",
+        L"WorkerW",
+    };
+
+    for (const wchar_t* chromeClass : SHELL_CHROME_CLASSES)
+    {
+        if (_wcsicmp(foregroundClass, chromeClass) == 0)
+            return;
     }
 
     bool isNativeSurface = false;
@@ -10883,11 +11061,23 @@ static void DismissNativeStartMenuIfNeeded(
             esc,
             sizeof(INPUT));
 
+        CancelPendingBlurClose();
         SetForegroundWindow(g_start);
         return;
     }
 
-    CloseStart();
+    // A genuinely different window — not one of ours, not shell chrome,
+    // not the native Start/Search flash — took foreground. Don't close
+    // immediately: arm the grace timer and let StartProc's WM_TIMER
+    // handler do it once the grace period actually elapses, so a
+    // transient blip (see the note above DismissNativeStartMenuIfNeeded)
+    // has a chance to self-correct first. If one's already running, leave
+    // it be rather than restarting the clock on every intermediate blip.
+    if (!g_blurCloseTimer)
+    {
+        g_blurCloseTimer =
+            SetTimer(g_start, TIMER_BLUR_CLOSE, BLUR_CLOSE_GRACE_MS, nullptr);
+    }
 }
 
 static void CALLBACK ForegroundEventProc(
