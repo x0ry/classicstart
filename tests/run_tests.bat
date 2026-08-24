@@ -42,7 +42,8 @@ cl.exe ^
  /link ^
  /SUBSYSTEM:CONSOLE ^
  /OUT:"%ROOT%tests.exe" ^
- user32.lib
+ user32.lib ^
+ shlwapi.lib
 
 if errorlevel 1 (
     echo.

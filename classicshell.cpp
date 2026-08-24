@@ -15,6 +15,11 @@
 #include <winioctl.h>
 #include <winver.h>
 #include <gdiplus.h>
+#include <shlwapi.h>
+#include <windowsx.h>
+#include <d3d11.h>
+#include <d2d1_3.h>
+#include <wincodec.h>
 
 #include <string>
 #include <vector>
@@ -22,6 +27,8 @@
 #include <cwctype>
 #include <fstream>
 #include <sstream>
+#include <mutex>
+#include <atomic>
 
 #include "starthook.h"
 
@@ -33,6 +40,11 @@
 #pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "version.lib")
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 static const wchar_t START_CLASS[] = L"ClassicShell.Native";
 
@@ -98,6 +110,7 @@ static const BYTE OPACITY_MIN = 90;
 static const BYTE OPACITY_MAX = 255;
 static BYTE g_windowAlpha = START_WINDOW_ALPHA;
 static bool g_sliderDragging = false;
+static bool g_searchDragging = false;
 
 static int g_hover = -1;
 static int g_powerHover = -1;
@@ -110,6 +123,7 @@ static int g_powerHover = -1;
 static int g_focusIndex = -1;
 
 static std::wstring g_searchText;
+static TextSelection g_searchSelection;
 
 static WinKeyTracker g_winKeyTracker;
 static StartButtonMouseTracker g_startButtonTracker;
@@ -120,6 +134,11 @@ static StartButtonMouseTracker g_startButtonTracker;
 // triggers ToggleStart(), so users who want it can opt back in while the
 // default leaves the native/legacy Start menu in charge of the Win key.
 static bool g_captureWinKey = false;
+
+// [Search] IndexPath from classicshell.ini — the folder background-indexed
+// at startup for the search box. Defaults to the user's profile folder
+// when blank.
+static std::wstring g_searchIndexRoot;
 
 static bool g_mouseTracking = false;
 
@@ -1584,50 +1603,6 @@ static bool OpenNativeRun()
 // Search Enter
 // ============================================================
 
-static void HandleSearchEnter()
-{
-    std::wstring command =
-        Trim(g_searchText);
-
-    if (command.empty())
-        return;
-
-    std::wstring lower =
-        Lower(command);
-
-    if (lower == L"run" ||
-        lower == L"run...")
-    {
-        g_searchText.clear();
-
-        OpenNativeRun();
-
-        return;
-    }
-
-    LaunchResult result =
-        ExecuteSmartInput(command);
-
-    if (result ==
-        LaunchResult::Success)
-    {
-        g_searchText.clear();
-
-        ShowWindow(
-            g_start,
-            SW_HIDE);
-
-        g_startVisible = false;
-        ResetUIState();
-
-        return;
-    }
-
-    g_searchText.clear();
-
-    OpenNativeRun();
-}
-
 // ============================================================
 // GDI helpers
 // ============================================================
@@ -2726,13 +2701,33 @@ static const char DEFAULT_CONFIG_CONTENT[] =
 "; ClassicShell's own menu instead (experimental: being hardened\r\n"
 "; over time). The taskbar Start button and Ctrl+Esc always open\r\n"
 "; ClassicShell's menu regardless of this setting.\r\n"
-"CaptureWinKey=0\r\n";
+"CaptureWinKey=0\r\n"
+"\r\n"
+"[Search]\r\n"
+"; Folder ClassicShell indexes in the background at startup so the\r\n"
+"; search box can find files by name. Type a wildcard pattern like\r\n"
+"; *.txt or report.* for an exact match, or just plain text like\r\n"
+"; report to find any file containing it. Blank = your user profile\r\n"
+"; folder. Indexing runs on a low-priority background thread and\r\n"
+"; never blocks the UI, however long the folder takes to walk.\r\n"
+"IndexPath=\r\n";
 
 static std::wstring GetConfigPath()
 {
     return
         GetExeDirectory() +
         CONFIG_FILE_NAME;
+}
+
+static std::wstring GetProfileDirectory()
+{
+    wchar_t path[MAX_PATH]{};
+    DWORD len = GetEnvironmentVariableW(L"USERPROFILE", path, MAX_PATH);
+
+    if (len == 0 || len >= MAX_PATH)
+        return L"";
+
+    return path;
 }
 
 // Writes the default config file iff nothing is there yet — never
@@ -2904,6 +2899,21 @@ static void LoadConfig()
             L"CaptureWinKey",
             0,
             configPath.c_str()) != 0;
+
+    wchar_t indexPath[MAX_PATH];
+
+    GetPrivateProfileStringW(
+        L"Search",
+        L"IndexPath",
+        L"",
+        indexPath,
+        MAX_PATH,
+        configPath.c_str());
+
+    g_searchIndexRoot = Trim(indexPath);
+
+    if (g_searchIndexRoot.empty())
+        g_searchIndexRoot = GetProfileDirectory();
 }
 
 static void DrawRealIcon(
@@ -3009,6 +3019,857 @@ static void BuildVisibleItems()
 
         g_itemCount = MAX_ITEMS;
     }
+}
+
+// Forward declarations for functions defined later in the file but
+// needed by the search/God Mode/panel code below, which sits earlier
+// than they do.
+static void CloseStart();
+static void ApplyWindowRounding(HWND hwnd);
+static void ApplyAcrylicBlur(HWND hwnd);
+static int GetFocusedSearchResultIndex();
+static void ResizeStartToContent(HWND hwnd);
+static void ShowPreviewForResult(int index);
+static void CancelPreviewFadeOut();
+static void BeginPreviewFadeOut();
+static void HidePreview();
+
+// Hover-preview state needed by the search panel's own WndProc (defined
+// below), even though the rest of the preview feature is implemented
+// later in the file, after PreviewKind/etc. exist.
+static HWND g_preview = nullptr;
+static int g_previewHoverIndex = -1;
+static UINT_PTR g_previewShowTimer = 0;
+static const UINT_PTR TIMER_PREVIEW_HOVER = 5;
+
+// ============================================================
+// File search — background index + query matching
+// ============================================================
+
+struct IndexedFile
+{
+    std::wstring fullPath;
+    std::wstring fileName;
+    std::wstring fileNameLower;
+};
+
+static const size_t MAX_INDEX_FILES = 200000;
+
+static std::vector<IndexedFile> g_fileIndex;
+static std::mutex g_fileIndexMutex;
+static std::atomic<size_t> g_indexedFileCount{ 0 };
+
+static void IndexDirectoryRecursive(
+    const std::wstring& dir,
+    std::vector<IndexedFile>& pending)
+{
+    if (g_indexedFileCount.load() + pending.size() >= MAX_INDEX_FILES)
+        return;
+
+    std::wstring pattern = dir + L"\\*";
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+
+    if (find == INVALID_HANDLE_VALUE)
+        return;
+
+    do
+    {
+        std::wstring name = data.cFileName;
+
+        if (name == L"." || name == L"..")
+            continue;
+
+        // Skip reparse points (junctions/symlinks) to avoid cycles.
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+            continue;
+
+        std::wstring fullPath = dir + L"\\" + name;
+
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            IndexDirectoryRecursive(fullPath, pending);
+        }
+        else
+        {
+            IndexedFile entry;
+            entry.fullPath = fullPath;
+            entry.fileName = name;
+            entry.fileNameLower = Lower(name);
+            pending.push_back(std::move(entry));
+
+            if (pending.size() >= 2000)
+            {
+                std::lock_guard<std::mutex> lock(g_fileIndexMutex);
+
+                for (auto& e : pending)
+                    g_fileIndex.push_back(std::move(e));
+
+                pending.clear();
+                g_indexedFileCount.store(g_fileIndex.size());
+            }
+        }
+
+        if (g_indexedFileCount.load() + pending.size() >= MAX_INDEX_FILES)
+            break;
+    }
+    while (FindNextFileW(find, &data));
+
+    FindClose(find);
+}
+
+static DWORD WINAPI IndexThreadProc(LPVOID)
+{
+    if (g_searchIndexRoot.empty())
+        return 0;
+
+    std::vector<IndexedFile> pending;
+    IndexDirectoryRecursive(g_searchIndexRoot, pending);
+
+    if (!pending.empty())
+    {
+        std::lock_guard<std::mutex> lock(g_fileIndexMutex);
+
+        for (auto& e : pending)
+            g_fileIndex.push_back(std::move(e));
+
+        g_indexedFileCount.store(g_fileIndex.size());
+    }
+
+    return 0;
+}
+
+// Started once at startup, never re-triggered. Runs at the lowest thread
+// priority so it never competes with UI responsiveness, however long the
+// configured folder takes to walk.
+static void StartBackgroundIndexing()
+{
+    HANDLE thread =
+        CreateThread(
+            nullptr, 0, IndexThreadProc, nullptr,
+            CREATE_SUSPENDED, nullptr);
+
+    if (!thread)
+        return;
+
+    SetThreadPriority(thread, THREAD_PRIORITY_LOWEST);
+    ResumeThread(thread);
+    CloseHandle(thread);
+}
+
+// ============================================================
+// Control Panel "God Mode" — every Control Panel item as one flat,
+// searchable/browsable list, via the well-known shell CLSID trick.
+// ============================================================
+
+struct GodModeItem
+{
+    std::wstring name;
+    std::wstring nameLower;
+    LPITEMIDLIST pidl = nullptr; // owned; never freed per-use, catalog lifetime.
+    HICON icon = nullptr;        // catalog-owned; never destroyed per-use.
+};
+
+static std::vector<GodModeItem> g_godModeItems;
+static std::mutex g_godModeMutex;
+
+// A bare "::{CLSID}" display name is rejected by SHParseDisplayName
+// directly (confirmed E_INVALIDARG); binding instead to a real, empty,
+// hidden-named folder whose name *ends* in the CLSID is the documented
+// workaround for exposing the "all Control Panel tasks" virtual folder.
+static std::wstring GetGodModeFolderPath()
+{
+    wchar_t tempPath[MAX_PATH]{};
+    DWORD len = GetTempPathW(MAX_PATH, tempPath);
+
+    if (len == 0 || len >= MAX_PATH)
+        return L"";
+
+    return
+        std::wstring(tempPath) +
+        L"ClassicShellGodMode.{ED7BA470-8E54-465E-825C-99712043E01C}";
+}
+
+static DWORD WINAPI GodModeThreadProc(LPVOID)
+{
+    HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    std::wstring folder = GetGodModeFolderPath();
+
+    if (!folder.empty())
+        CreateDirectoryW(folder.c_str(), nullptr);
+
+    PIDLIST_ABSOLUTE rootPidl = nullptr;
+
+    if (folder.empty() ||
+        FAILED(SHParseDisplayName(folder.c_str(), nullptr, &rootPidl, 0, nullptr)) ||
+        !rootPidl)
+    {
+        if (SUCCEEDED(com)) CoUninitialize();
+        return 0;
+    }
+
+    IShellFolder* desktop = nullptr;
+
+    if (FAILED(SHGetDesktopFolder(&desktop)) || !desktop)
+    {
+        CoTaskMemFree(rootPidl);
+        if (SUCCEEDED(com)) CoUninitialize();
+        return 0;
+    }
+
+    IShellFolder* rootFolder = nullptr;
+    HRESULT hr = desktop->BindToObject(rootPidl, nullptr, IID_PPV_ARGS(&rootFolder));
+
+    if (FAILED(hr) || !rootFolder)
+    {
+        desktop->Release();
+        CoTaskMemFree(rootPidl);
+        if (SUCCEEDED(com)) CoUninitialize();
+        return 0;
+    }
+
+    IEnumIDList* enumIds = nullptr;
+
+    hr =
+        rootFolder->EnumObjects(
+            nullptr,
+            SHCONTF_FOLDERS | SHCONTF_NONFOLDERS | SHCONTF_INCLUDEHIDDEN,
+            &enumIds);
+
+    std::vector<GodModeItem> items;
+
+    if (SUCCEEDED(hr) && enumIds)
+    {
+        LPITEMIDLIST childPidl = nullptr;
+        ULONG fetched = 0;
+
+        while (enumIds->Next(1, &childPidl, &fetched) == S_OK && fetched == 1)
+        {
+            STRRET strret{};
+            std::wstring name;
+
+            if (SUCCEEDED(rootFolder->GetDisplayNameOf(childPidl, SHGDN_NORMAL, &strret)))
+            {
+                wchar_t buf[512]{};
+
+                if (SUCCEEDED(StrRetToBufW(&strret, childPidl, buf, 512)))
+                    name = buf;
+            }
+
+            LPITEMIDLIST absolutePidl =
+                name.empty() ? nullptr : ILCombine(rootPidl, childPidl);
+
+            if (absolutePidl)
+            {
+                GodModeItem item;
+                item.name = name;
+                item.nameLower = Lower(name);
+                item.pidl = absolutePidl;
+
+                SHFILEINFOW info{};
+
+                if (SHGetFileInfoW(
+                        (LPCWSTR)absolutePidl,
+                        0,
+                        &info,
+                        sizeof(info),
+                        SHGFI_PIDL | SHGFI_ICON | SHGFI_LARGEICON))
+                {
+                    item.icon = info.hIcon;
+                }
+
+                items.push_back(item);
+            }
+
+            CoTaskMemFree(childPidl);
+        }
+
+        enumIds->Release();
+    }
+
+    rootFolder->Release();
+    desktop->Release();
+    CoTaskMemFree(rootPidl);
+
+    std::sort(
+        items.begin(), items.end(),
+        [](const GodModeItem& a, const GodModeItem& b)
+        {
+            return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
+        });
+
+    {
+        std::lock_guard<std::mutex> lock(g_godModeMutex);
+        g_godModeItems = std::move(items);
+    }
+
+    if (SUCCEEDED(com))
+        CoUninitialize();
+
+    return 0;
+}
+
+static void StartGodModeIndexing()
+{
+    HANDLE thread =
+        CreateThread(
+            nullptr, 0, GodModeThreadProc, nullptr,
+            CREATE_SUSPENDED, nullptr);
+
+    if (!thread)
+        return;
+
+    SetThreadPriority(thread, THREAD_PRIORITY_LOWEST);
+    ResumeThread(thread);
+    CloseHandle(thread);
+}
+
+// Invokes the PIDL's default verb, exactly as a double-click would —
+// there's no ".cpl" command string to shell out to for these tasks.
+static void LaunchGodModeItem(const GodModeItem& item)
+{
+    if (!item.pidl)
+        return;
+
+    SHELLEXECUTEINFOW info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_INVOKEIDLIST;
+    info.lpIDList = item.pidl;
+    info.nShow = SW_SHOWNORMAL;
+
+    ShellExecuteExW(&info);
+}
+
+// ============================================================
+// Search results (files + God Mode Control Panel items)
+// ============================================================
+
+enum class SearchResultKind
+{
+    File,
+    GodMode
+};
+
+struct SearchResultEntry
+{
+    SearchResultKind kind = SearchResultKind::File;
+    size_t fileIndex = 0;
+    size_t godModeIndex = 0;
+
+    // Snapshotted at match time (not re-fetched per paint): the display
+    // name and, for File results, a freshly-extracted icon this entry
+    // owns and must destroy; GodMode icons are catalog-owned and never
+    // destroyed here.
+    std::wstring displayName;
+    HICON icon = nullptr;
+};
+
+static const size_t MAX_SEARCH_RESULTS = 50;
+static const size_t MAX_GODMODE_SEARCH_MATCHES = 6;
+
+static std::vector<SearchResultEntry> g_searchResults;
+static int g_searchResultHover = -1;
+static int g_searchResultsScroll = 0;
+static bool g_controlPanelBrowsing = false;
+
+// Defined later, near the search panel window itself — forward declared
+// so the result-building functions above can show/hide/resize it.
+static void RepositionSearchPanel();
+
+static void ClearSearchResults()
+{
+    for (auto& entry : g_searchResults)
+    {
+        if (entry.kind == SearchResultKind::File && entry.icon)
+            DestroyIcon(entry.icon);
+    }
+
+    g_searchResults.clear();
+    g_searchResultHover = -1;
+    g_searchResultsScroll = 0;
+    g_controlPanelBrowsing = false;
+}
+
+// Recomputes g_searchResults from the current g_searchText. For an
+// implicit-contains query (plain text, not a wildcard) God Mode items are
+// matched first and sorted ahead of file results, capped at
+// MAX_GODMODE_SEARCH_MATCHES — a wildcard pattern doesn't mean anything
+// against a Control Panel task's name, so wildcard queries never match
+// God Mode items. No relevance scoring beyond that: first-match-wins, in
+// index order, up to MAX_SEARCH_RESULTS total.
+static void RefreshSearchResults()
+{
+    ClearSearchResults();
+
+    std::wstring query = Trim(g_searchText);
+
+    if (query.empty())
+    {
+        RepositionSearchPanel();
+        return;
+    }
+
+    bool wildcard = IsWildcardQuery(query);
+    std::wstring queryLower = Lower(query);
+
+    if (!wildcard)
+    {
+        std::lock_guard<std::mutex> lock(g_godModeMutex);
+
+        for (size_t i = 0;
+             i < g_godModeItems.size() &&
+                 g_searchResults.size() < MAX_GODMODE_SEARCH_MATCHES;
+             ++i)
+        {
+            if (g_godModeItems[i].nameLower.find(queryLower) == std::wstring::npos)
+                continue;
+
+            SearchResultEntry entry;
+            entry.kind = SearchResultKind::GodMode;
+            entry.godModeIndex = i;
+            entry.displayName = g_godModeItems[i].name;
+            entry.icon = g_godModeItems[i].icon;
+            g_searchResults.push_back(entry);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_fileIndexMutex);
+
+        for (size_t i = 0;
+             i < g_fileIndex.size() &&
+                 g_searchResults.size() < MAX_SEARCH_RESULTS;
+             ++i)
+        {
+            const IndexedFile& file = g_fileIndex[i];
+
+            if (!MatchesSearchQuery(file.fileName, file.fileNameLower, query, queryLower))
+                continue;
+
+            SearchResultEntry entry;
+            entry.kind = SearchResultKind::File;
+            entry.fileIndex = i;
+            entry.displayName = file.fileName;
+            entry.icon = GetFileIcon(file.fullPath.c_str());
+            g_searchResults.push_back(entry);
+        }
+    }
+
+    RepositionSearchPanel();
+}
+
+static void LaunchSearchResult(size_t index)
+{
+    if (index >= g_searchResults.size())
+        return;
+
+    const SearchResultEntry entry = g_searchResults[index];
+
+    if (entry.kind == SearchResultKind::GodMode)
+    {
+        std::lock_guard<std::mutex> lock(g_godModeMutex);
+
+        if (entry.godModeIndex < g_godModeItems.size())
+            LaunchGodModeItem(g_godModeItems[entry.godModeIndex]);
+    }
+    else
+    {
+        std::wstring path;
+
+        {
+            std::lock_guard<std::mutex> lock(g_fileIndexMutex);
+
+            if (entry.fileIndex < g_fileIndex.size())
+                path = g_fileIndex[entry.fileIndex].fullPath;
+        }
+
+        if (path.empty())
+            return;
+
+        HINSTANCE result =
+            ShellExecuteW(
+                nullptr, L"open", path.c_str(),
+                nullptr, nullptr, SW_SHOWNORMAL);
+
+        if ((INT_PTR)result <= 32)
+            return;
+    }
+
+    g_searchText.clear();
+    g_searchSelection.Reset();
+    ClearSearchResults();
+    RepositionSearchPanel();
+    CloseStart();
+}
+
+// The "Control Panel" menu row toggles a full listing of every God Mode
+// item into the results panel — a disclosure, not a launcher.
+static void ToggleControlPanelBrowse()
+{
+    bool wasBrowsing = g_controlPanelBrowsing;
+
+    ClearSearchResults();
+
+    if (wasBrowsing)
+    {
+        RepositionSearchPanel();
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_godModeMutex);
+
+    for (size_t i = 0; i < g_godModeItems.size(); ++i)
+    {
+        SearchResultEntry entry;
+        entry.kind = SearchResultKind::GodMode;
+        entry.godModeIndex = i;
+        entry.displayName = g_godModeItems[i].name;
+        entry.icon = g_godModeItems[i].icon;
+        g_searchResults.push_back(entry);
+    }
+
+    g_controlPanelBrowsing = true;
+
+    RepositionSearchPanel();
+}
+
+// ============================================================
+// Search box editing — shared by KeyboardProc (the guaranteed path) and
+// StartProc's own WM_KEYDOWN/WM_CHAR, so caret/selection behavior can't
+// drift between the two input paths the way the old append-only/
+// pop_back-only logic was duplicated in both without a caret concept.
+// ============================================================
+
+static void InsertSearchChar(
+    HWND hwnd,
+    wchar_t c)
+{
+    bool wasEmpty = g_searchText.empty();
+
+    if (g_searchSelection.HasSelection())
+    {
+        int start = g_searchSelection.SelectionStart();
+        int end = g_searchSelection.SelectionEnd();
+
+        g_searchText.erase(start, end - start);
+        g_searchSelection.PlaceCaret(start);
+    }
+
+    int pos = g_searchSelection.Caret();
+
+    g_searchText.insert((size_t)pos, 1, c);
+    g_searchSelection.PlaceCaret(pos + 1);
+
+    g_caretVisible = true;
+
+    RefreshSearchResults();
+
+    if (wasEmpty)
+        ResizeStartToContent(hwnd);
+
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+static void DeleteSearchSelectionOrCharBefore(
+    HWND hwnd)
+{
+    if (g_searchSelection.HasSelection())
+    {
+        int start = g_searchSelection.SelectionStart();
+        int end = g_searchSelection.SelectionEnd();
+
+        g_searchText.erase(start, end - start);
+        g_searchSelection.PlaceCaret(start);
+    }
+    else
+    {
+        int caret = g_searchSelection.Caret();
+
+        if (caret <= 0)
+            return;
+
+        g_searchText.erase((size_t)caret - 1, 1);
+        g_searchSelection.PlaceCaret(caret - 1);
+    }
+
+    g_caretVisible = true;
+
+    RefreshSearchResults();
+
+    if (g_searchText.empty())
+        ResizeStartToContent(hwnd);
+
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+static void DeleteSearchSelectionOrCharAfter(
+    HWND hwnd)
+{
+    if (g_searchSelection.HasSelection())
+    {
+        int start = g_searchSelection.SelectionStart();
+        int end = g_searchSelection.SelectionEnd();
+
+        g_searchText.erase(start, end - start);
+        g_searchSelection.PlaceCaret(start);
+    }
+    else
+    {
+        int caret = g_searchSelection.Caret();
+
+        if (caret >= (int)g_searchText.size())
+            return;
+
+        g_searchText.erase((size_t)caret, 1);
+    }
+
+    g_caretVisible = true;
+
+    RefreshSearchResults();
+
+    if (g_searchText.empty())
+        ResizeStartToContent(hwnd);
+
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+static void CopySearchSelectionToClipboard(
+    HWND hwnd)
+{
+    if (!g_searchSelection.HasSelection())
+        return;
+
+    int start = g_searchSelection.SelectionStart();
+    int end = g_searchSelection.SelectionEnd();
+
+    std::wstring selected = g_searchText.substr(start, end - start);
+
+    if (!OpenClipboard(hwnd))
+        return;
+
+    EmptyClipboard();
+
+    size_t bytes = (selected.size() + 1) * sizeof(wchar_t);
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+
+    if (mem)
+    {
+        void* ptr = GlobalLock(mem);
+
+        if (ptr)
+        {
+            memcpy(ptr, selected.c_str(), bytes);
+            GlobalUnlock(mem);
+            SetClipboardData(CF_UNICODETEXT, mem);
+        }
+        else
+        {
+            GlobalFree(mem);
+        }
+    }
+
+    CloseClipboard();
+}
+
+// Caret movement / selection / select-all / copy, shared by both input
+// paths. Returns true if the key was handled (caller should swallow it).
+// Does not handle character insertion, Backspace, or Delete — those stay
+// as separate calls at each call site since the two paths already differ
+// slightly in how they detect "should the search box handle this at
+// all" before reaching here.
+static bool HandleSearchBoxNavigationKey(
+    HWND hwnd,
+    DWORD vk,
+    bool ctrl,
+    bool shift)
+{
+    int textLength = (int)g_searchText.size();
+
+    switch (vk)
+    {
+        case VK_LEFT:
+            g_searchSelection.MoveLeft(shift);
+            g_caretVisible = true;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return true;
+
+        case VK_RIGHT:
+            g_searchSelection.MoveRight(shift, textLength);
+            g_caretVisible = true;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return true;
+
+        case VK_HOME:
+            g_searchSelection.MoveHome(shift);
+            g_caretVisible = true;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return true;
+
+        case VK_END:
+            g_searchSelection.MoveEnd(shift, textLength);
+            g_caretVisible = true;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return true;
+
+        case 'A':
+            if (ctrl)
+            {
+                g_searchSelection.SelectAll(textLength);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return true;
+            }
+            return false;
+
+        case 'C':
+            if (ctrl)
+            {
+                CopySearchSelectionToClipboard(hwnd);
+                return true;
+            }
+            return false;
+    }
+
+    return false;
+}
+
+// Places the caret at the character offset nearest screen point `pt`,
+// within the search box whose text starts at screen x `textLeft`.
+// extend=true grows a selection (mouse drag); false starts a fresh one
+// (mouse down).
+// Character index into g_searchText nearest screen x `pointX`, given the
+// text's own screen x origin `textLeft`. Shared by click-to-place-caret,
+// drag-to-select, and double-click-to-select-word, so all three agree on
+// exactly where in the text a given pixel maps to.
+static int SearchCharIndexFromX(
+    HWND hwnd,
+    int textLeft,
+    int pointX)
+{
+    HDC dc = GetDC(hwnd);
+
+    if (!dc)
+        return 0;
+
+    HGDIOBJ old = SelectObject(dc, g_font);
+
+    int relativeX = pointX - textLeft;
+
+    int fitChars = 0;
+    SIZE sz{};
+
+    if (relativeX > 0)
+    {
+        GetTextExtentExPointW(
+            dc, g_searchText.c_str(), (int)g_searchText.size(),
+            relativeX, &fitChars, nullptr, &sz);
+    }
+
+    SelectObject(dc, old);
+    ReleaseDC(hwnd, dc);
+
+    return fitChars;
+}
+
+static void PlaceSearchCaretFromPoint(
+    HWND hwnd,
+    int textLeft,
+    int pointX,
+    bool extend)
+{
+    int pos = SearchCharIndexFromX(hwnd, textLeft, pointX);
+
+    g_searchSelection.PlaceCaret(pos, extend);
+    g_caretVisible = true;
+
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+// Double-click: selects the word (or run of non-word characters) under
+// the click, matching the classic text-box convention.
+static void SelectSearchWordAtPoint(
+    HWND hwnd,
+    int textLeft,
+    int pointX)
+{
+    if (g_searchText.empty())
+        return;
+
+    int pos = SearchCharIndexFromX(hwnd, textLeft, pointX);
+
+    int start = 0;
+    int end = 0;
+
+    FindWordBoundsAt(g_searchText, pos, start, end);
+
+    g_searchSelection.PlaceCaret(start, false);
+    g_searchSelection.PlaceCaret(end, true);
+
+    g_caretVisible = true;
+
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+static void HandleSearchEnter()
+{
+    // A populated results panel takes priority over command resolution —
+    // Enter launches the top result, same as clicking it, whether that's
+    // a file or a God Mode Control Panel item.
+    if (!g_searchResults.empty())
+    {
+        LaunchSearchResult(0);
+        return;
+    }
+
+    std::wstring command =
+        Trim(g_searchText);
+
+    if (command.empty())
+        return;
+
+    std::wstring lower =
+        Lower(command);
+
+    if (lower == L"run" ||
+        lower == L"run...")
+    {
+        g_searchText.clear();
+        g_searchSelection.Reset();
+        ClearSearchResults();
+        RepositionSearchPanel();
+
+        OpenNativeRun();
+
+        return;
+    }
+
+    LaunchResult result =
+        ExecuteSmartInput(command);
+
+    if (result ==
+        LaunchResult::Success)
+    {
+        g_searchText.clear();
+        g_searchSelection.Reset();
+        ClearSearchResults();
+        RepositionSearchPanel();
+
+        ShowWindow(
+            g_start,
+            SW_HIDE);
+
+        g_startVisible = false;
+        ResetUIState();
+
+        return;
+    }
+
+    g_searchText.clear();
+    g_searchSelection.Reset();
+    ClearSearchResults();
+    RepositionSearchPanel();
+
+    OpenNativeRun();
 }
 
 // ============================================================
@@ -3167,6 +4028,2075 @@ static void ResizeStartToContent(
         hwnd,
         nullptr,
         FALSE);
+}
+
+// ============================================================
+// Search results panel — a separate top-level window shown beside the
+// main menu, so the main menu's own layout never has to shift to make
+// room for it.
+// ============================================================
+
+static const wchar_t SEARCH_PANEL_CLASS[] = L"ClassicShell.SearchPanel";
+static HWND g_searchPanel = nullptr;
+
+static int SidePanelGap()
+{
+    return S(10);
+}
+
+// Same width as the main column — a "twin card" beside it.
+static int SidePanelWidth()
+{
+    return S(210);
+}
+
+static RECT GetSearchPanelRect()
+{
+    RECT main = GetStartRect();
+    int width = SidePanelWidth();
+
+    return
+    {
+        main.right + SidePanelGap(),
+        main.top,
+        main.right + SidePanelGap() + width,
+        main.bottom
+    };
+}
+
+static int SearchResultRowHeight()
+{
+    return S(36);
+}
+
+static int SearchResultsVisibleRowCount(
+    int panelHeight)
+{
+    int usable = panelHeight - S(16);
+    int stride = SearchResultRowHeight() + S(2);
+
+    return usable > 0 ? usable / stride : 0;
+}
+
+static void ClampSearchResultsScroll(
+    int panelHeight)
+{
+    int visibleRows = SearchResultsVisibleRowCount(panelHeight);
+    int maxScrollRows =
+        (int)g_searchResults.size() - visibleRows;
+
+    int maxScroll =
+        maxScrollRows > 0
+            ? maxScrollRows * (SearchResultRowHeight() + S(2))
+            : 0;
+
+    if (g_searchResultsScroll < 0)
+        g_searchResultsScroll = 0;
+
+    if (g_searchResultsScroll > maxScroll)
+        g_searchResultsScroll = maxScroll;
+}
+
+static RECT GetSearchResultRect(
+    int index)
+{
+    int top =
+        S(8) +
+        index * (SearchResultRowHeight() + S(2)) -
+        g_searchResultsScroll;
+
+    RECT panel{};
+    GetClientRect(g_searchPanel, &panel);
+
+    return
+    {
+        S(6),
+        top,
+        (panel.right - panel.left) - S(6),
+        top + SearchResultRowHeight()
+    };
+}
+
+static void PaintSearchPanel(
+    HWND hwnd,
+    HDC dc)
+{
+    RECT client{};
+    GetClientRect(hwnd, &client);
+
+    int width = client.right;
+    int height = client.bottom;
+
+    HDC back = CreateCompatibleDC(dc);
+
+    if (!back)
+        return;
+
+    HBITMAP bitmap = CreateCompatibleBitmap(dc, width, height);
+
+    if (!bitmap)
+    {
+        DeleteDC(back);
+        return;
+    }
+
+    HGDIOBJ old = SelectObject(back, bitmap);
+
+    FillRectColor(back, client, g_bg);
+    DrawRoundBorder(back, client, S(18), g_border);
+
+    int keyboardFocusedIndex = GetFocusedSearchResultIndex();
+
+    for (size_t i = 0; i < g_searchResults.size(); ++i)
+    {
+        RECT r = GetSearchResultRect((int)i);
+
+        if (r.bottom < 0 || r.top > height)
+            continue;
+
+        bool hovered = g_searchResultHover == (int)i;
+        bool keyboardFocused =
+            keyboardFocusedIndex == (int)i;
+
+        if (hovered || keyboardFocused)
+        {
+            DrawTile(
+                back, r, S(9),
+                g_hot, g_accentBorder,
+                hovered ? 255 : 180);
+        }
+
+        const SearchResultEntry& entry = g_searchResults[i];
+
+        if (entry.icon)
+        {
+            DrawRealIcon(
+                back, entry.icon,
+                r.left + S(4),
+                r.top + (SearchResultRowHeight() - S(20)) / 2,
+                S(20));
+        }
+
+        DrawTextSimple(
+            back,
+            entry.displayName.c_str(),
+            r.left + S(30),
+            r.top,
+            (r.right - r.left) - S(34),
+            r.bottom - r.top,
+            g_text,
+            g_font,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    if (g_searchResults.empty())
+    {
+        RECT msgRect = { S(10), S(10), width - S(10), height - S(10) };
+
+        DrawTextSimple(
+            back,
+            g_controlPanelBrowsing ? L"No Control Panel items found" : L"No results",
+            msgRect.left,
+            msgRect.top,
+            msgRect.right - msgRect.left,
+            msgRect.bottom - msgRect.top,
+            g_muted,
+            g_font,
+            DT_LEFT | DT_TOP | DT_WORDBREAK);
+    }
+
+    BitBlt(dc, 0, 0, width, height, back, 0, 0, SRCCOPY);
+
+    SelectObject(back, old);
+    DeleteObject(bitmap);
+    DeleteDC(back);
+}
+
+static int SearchResultRowFromPoint(
+    int y)
+{
+    RECT client{};
+    GetClientRect(g_searchPanel, &client);
+
+    for (size_t i = 0; i < g_searchResults.size(); ++i)
+    {
+        RECT r = GetSearchResultRect((int)i);
+
+        if (y >= r.top && y < r.bottom)
+            return (int)i;
+    }
+
+    return -1;
+}
+
+static LRESULT CALLBACK SearchPanelProc(
+    HWND hwnd,
+    UINT msg,
+    WPARAM wp,
+    LPARAM lp)
+{
+    switch (msg)
+    {
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_PAINT:
+        {
+            PAINTSTRUCT ps{};
+            HDC dc = BeginPaint(hwnd, &ps);
+
+            if (dc)
+                PaintSearchPanel(hwnd, dc);
+
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        case WM_MOUSEMOVE:
+        {
+            int y = GET_Y_LPARAM(lp);
+            int row = SearchResultRowFromPoint(y);
+
+            if (row != g_searchResultHover)
+            {
+                g_searchResultHover = row;
+                InvalidateRect(hwnd, nullptr, FALSE);
+
+                if (g_previewShowTimer)
+                {
+                    KillTimer(hwnd, TIMER_PREVIEW_HOVER);
+                    g_previewShowTimer = 0;
+                }
+
+                if (row >= 0)
+                {
+                    CancelPreviewFadeOut();
+                    g_previewHoverIndex = row;
+
+                    g_previewShowTimer =
+                        SetTimer(hwnd, TIMER_PREVIEW_HOVER, 150, nullptr);
+                }
+                else
+                {
+                    BeginPreviewFadeOut();
+                }
+            }
+
+            TRACKMOUSEEVENT tme{};
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            TrackMouseEvent(&tme);
+
+            return 0;
+        }
+
+        case WM_MOUSELEAVE:
+        {
+            if (g_searchResultHover != -1)
+            {
+                g_searchResultHover = -1;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+
+            if (g_previewShowTimer)
+            {
+                KillTimer(hwnd, TIMER_PREVIEW_HOVER);
+                g_previewShowTimer = 0;
+            }
+
+            BeginPreviewFadeOut();
+
+            return 0;
+        }
+
+        case WM_TIMER:
+        {
+            if (wp == TIMER_PREVIEW_HOVER)
+            {
+                KillTimer(hwnd, TIMER_PREVIEW_HOVER);
+                g_previewShowTimer = 0;
+
+                if (g_previewHoverIndex == g_searchResultHover)
+                    ShowPreviewForResult(g_previewHoverIndex);
+
+                return 0;
+            }
+
+            break;
+        }
+
+        case WM_LBUTTONDOWN:
+        {
+            int y = GET_Y_LPARAM(lp);
+            int row = SearchResultRowFromPoint(y);
+
+            if (row >= 0)
+                LaunchSearchResult((size_t)row);
+
+            return 0;
+        }
+
+        case WM_MOUSEWHEEL:
+        {
+            int delta = GET_WHEEL_DELTA_WPARAM(wp);
+            RECT client{};
+            GetClientRect(hwnd, &client);
+
+            g_searchResultsScroll -=
+                (delta / WHEEL_DELTA) *
+                (SearchResultRowHeight() + S(2));
+
+            ClampSearchResultsScroll(client.bottom);
+
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+    }
+
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static bool CreateSearchPanelWindow(
+    HINSTANCE instance)
+{
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = SearchPanelProc;
+    wc.hInstance = instance;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = SEARCH_PANEL_CLASS;
+
+    if (!RegisterClassExW(&wc) &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    {
+        return false;
+    }
+
+    RECT r = GetSearchPanelRect();
+
+    g_searchPanel =
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
+            SEARCH_PANEL_CLASS,
+            L"ClassicShell Search",
+            WS_POPUP,
+            r.left, r.top,
+            r.right - r.left, r.bottom - r.top,
+            nullptr, nullptr, instance, nullptr);
+
+    if (!g_searchPanel)
+        return false;
+
+    SetLayeredWindowAttributes(g_searchPanel, 0, g_windowAlpha, LWA_ALPHA);
+    ApplyWindowRounding(g_searchPanel);
+    ApplyAcrylicBlur(g_searchPanel);
+
+    return true;
+}
+
+// Shows/hides/repositions the panel to match current results and
+// whether the main menu itself is visible — not animated like the main
+// menu's own open/close, a deliberate simplification since this is a
+// satellite window rather than part of the same surface.
+static void RepositionSearchPanel()
+{
+    if (!g_searchPanel)
+        return;
+
+    if (!g_startVisible || g_searchResults.empty())
+    {
+        ShowWindow(g_searchPanel, SW_HIDE);
+        HidePreview();
+        return;
+    }
+
+    RECT r = GetSearchPanelRect();
+
+    ClampSearchResultsScroll(r.bottom - r.top);
+
+    SetWindowPos(
+        g_searchPanel,
+        HWND_TOPMOST,
+        r.left, r.top,
+        r.right - r.left, r.bottom - r.top,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+    InvalidateRect(g_searchPanel, nullptr, FALSE);
+}
+
+// ============================================================
+// Hover preview — a small translucent panel that pops up in the work
+// area's opposite corner from the menu when the mouse rests on a search
+// result row long enough, showing a quick look at a text/JSON/XML file
+// or an image (including SVG) without having to open it.
+// ============================================================
+
+static const wchar_t PREVIEW_CLASS[] = L"ClassicShell.Preview";
+
+enum class PreviewKind
+{
+    None,
+    Text,
+    Image
+};
+
+static PreviewKind g_previewKind = PreviewKind::None;
+static std::wstring g_previewPath;
+static std::wstring g_previewText;
+static bool g_previewTextTruncated = false;
+static int g_previewTextScroll = 0;
+
+// ------------------------------------------------------------------
+// JSON/XML pretty-print + syntax coloring
+// ------------------------------------------------------------------
+
+enum class PreviewHighlightLang
+{
+    None,
+    Json,
+    Xml
+};
+
+enum class PreviewTokenColor
+{
+    Default,
+    Key,
+    String,
+    Number,
+    Keyword,
+    Punctuation,
+    TagName,
+    AttrName,
+    AttrValue,
+    Comment
+};
+
+struct PreviewColorSpan
+{
+    size_t start;
+    size_t length;
+    PreviewTokenColor color;
+};
+
+static PreviewHighlightLang g_previewHighlightLang = PreviewHighlightLang::None;
+static std::vector<PreviewColorSpan> g_previewColorSpans;
+
+// ------------------------------------------------------------------
+// Word-wrap layout
+// ------------------------------------------------------------------
+
+struct PreviewDisplayLine
+{
+    size_t start;
+    size_t length;
+};
+
+static std::vector<PreviewDisplayLine> g_previewDisplayLines;
+
+static Gdiplus::Bitmap* g_previewImage = nullptr;
+static BYTE* g_previewImagePixels = nullptr; // backs g_previewImage for SVG renders; freed alongside it.
+static int g_previewImageW = 0;
+static int g_previewImageH = 0;
+
+// g_preview, g_previewHoverIndex, g_previewShowTimer, and
+// TIMER_PREVIEW_HOVER are declared earlier in the file (see the forward
+// declarations before the file-search section), since the search panel's
+// own WndProc needs them and is defined before this point.
+
+static UINT_PTR g_previewFadeTimer = 0;
+static const UINT_PTR TIMER_PREVIEW_FADE = 6;
+static float g_previewAlpha = 1.0f;
+static DWORD g_previewFadeStartTick = 0;
+
+static const int PREVIEW_FADE_GRACE_MS = 550;
+static const int PREVIEW_FADE_DURATION_MS = 250;
+static const BYTE PREVIEW_BASE_ALPHA = 235;
+static const size_t PREVIEW_TEXT_MAX_BYTES = 65536;
+
+static const wchar_t* const PREVIEW_TEXT_EXTENSIONS[] =
+{
+    L"txt", L"log", L"ini", L"json", L"xml", L"csv", L"md",
+    L"h", L"hpp", L"c", L"cpp", L"cs", L"js", L"ts", L"py",
+    L"bat", L"ps1", L"yml", L"yaml", L"cfg", L"conf"
+};
+
+static const wchar_t* const PREVIEW_IMAGE_EXTENSIONS[] =
+{
+    L"png", L"jpg", L"jpeg", L"bmp", L"gif", L"ico", L"tif", L"tiff"
+};
+
+static std::wstring FileExtensionLower(const std::wstring& path)
+{
+    size_t dot = path.find_last_of(L'.');
+    size_t slash = path.find_last_of(L"\\/");
+
+    if (dot == std::wstring::npos ||
+        (slash != std::wstring::npos && dot < slash))
+    {
+        return L"";
+    }
+
+    return Lower(path.substr(dot + 1));
+}
+
+// isSvg is set when the image kind is specifically SVG, since that path
+// needs Direct2D instead of GDI+.
+static PreviewKind ClassifyPreview(const std::wstring& path, bool& isSvg)
+{
+    isSvg = false;
+
+    std::wstring ext = FileExtensionLower(path);
+
+    if (ext.empty())
+        return PreviewKind::None;
+
+    if (ext == L"svg")
+    {
+        isSvg = true;
+        return PreviewKind::Image;
+    }
+
+    for (const wchar_t* e : PREVIEW_IMAGE_EXTENSIONS)
+        if (ext == e) return PreviewKind::Image;
+
+    for (const wchar_t* e : PREVIEW_TEXT_EXTENSIONS)
+        if (ext == e) return PreviewKind::Text;
+
+    return PreviewKind::None;
+}
+
+static bool LoadPreviewTextFile(
+    const std::wstring& path,
+    std::wstring& outText,
+    bool& outTruncated)
+{
+    outText.clear();
+    outTruncated = false;
+
+    HANDLE file =
+        CreateFileW(
+            path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+
+    LARGE_INTEGER size{};
+    GetFileSizeEx(file, &size);
+
+    DWORD toRead =
+        (DWORD)std::min<LONGLONG>(
+            (LONGLONG)PREVIEW_TEXT_MAX_BYTES, size.QuadPart);
+
+    outTruncated = (LONGLONG)toRead < size.QuadPart;
+
+    std::vector<BYTE> buf(toRead);
+    DWORD read = 0;
+    BOOL ok = toRead == 0 ? TRUE : ReadFile(file, buf.data(), toRead, &read, nullptr);
+
+    CloseHandle(file);
+
+    if (!ok)
+        return false;
+
+    if (read >= 2 && buf[0] == 0xFF && buf[1] == 0xFE)
+    {
+        outText.assign(
+            reinterpret_cast<wchar_t*>(buf.data() + 2),
+            (read - 2) / 2);
+    }
+    else
+    {
+        size_t off =
+            (read >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF)
+                ? 3 : 0;
+
+        int wlen =
+            MultiByteToWideChar(
+                CP_UTF8, 0,
+                reinterpret_cast<char*>(buf.data()) + off,
+                (int)(read - off),
+                nullptr, 0);
+
+        if (wlen > 0)
+        {
+            outText.resize(wlen);
+
+            MultiByteToWideChar(
+                CP_UTF8, 0,
+                reinterpret_cast<char*>(buf.data()) + off,
+                (int)(read - off),
+                &outText[0], wlen);
+        }
+    }
+
+    return true;
+}
+
+static Gdiplus::Bitmap* LoadPreviewImageFile(const std::wstring& path)
+{
+    Gdiplus::Bitmap* bmp = new Gdiplus::Bitmap(path.c_str());
+
+    if (bmp->GetLastStatus() != Gdiplus::Ok)
+    {
+        delete bmp;
+        return nullptr;
+    }
+
+    return bmp;
+}
+
+// GDI+ has no SVG support, so this renders through Direct2D's native SVG
+// document API over a Direct3D11 device (hardware, falling back to the
+// WARP software rasterizer when no GPU driver is available — some VMs/
+// remote sessions). The full device/context is created and torn down on
+// every call rather than kept alive, which is fine since a hover preview
+// only pays this cost once per file, debounced behind the same hover
+// timer as everything else. Returns a heap Gdiplus::Bitmap wrapping a
+// pixel buffer stashed in *outPixels — GDI+ does not copy that buffer,
+// so the caller must keep it alive exactly as long as the bitmap and
+// free both together.
+static Gdiplus::Bitmap* RenderSvgToBitmap(
+    const std::wstring& path,
+    int workAreaW,
+    int workAreaH,
+    BYTE** outPixels)
+{
+    *outPixels = nullptr;
+
+    ID3D11Device* d3dDevice = nullptr;
+    ID3D11DeviceContext* d3dContext = nullptr;
+    D3D_FEATURE_LEVEL featureLevel{};
+
+    HRESULT hr =
+        D3D11CreateDevice(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            nullptr, 0, D3D11_SDK_VERSION,
+            &d3dDevice, &featureLevel, &d3dContext);
+
+    if (FAILED(hr))
+    {
+        hr =
+            D3D11CreateDevice(
+                nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                nullptr, 0, D3D11_SDK_VERSION,
+                &d3dDevice, &featureLevel, &d3dContext);
+    }
+
+    if (FAILED(hr) || !d3dDevice)
+        return nullptr;
+
+    Gdiplus::Bitmap* result = nullptr;
+
+    IDXGIDevice* dxgiDevice = nullptr;
+    ID2D1Factory1* d2dFactory = nullptr;
+    ID2D1Device* d2dDevice = nullptr;
+    ID2D1DeviceContext* baseContext = nullptr;
+    ID2D1DeviceContext5* dc5 = nullptr;
+    IWICImagingFactory* wic = nullptr;
+    IWICStream* stream = nullptr;
+    ID2D1SvgDocument* svgDoc = nullptr;
+    ID2D1Bitmap1* targetBitmap = nullptr;
+    ID2D1Bitmap1* stagingBitmap = nullptr;
+
+    d3dDevice->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
+
+    if (dxgiDevice &&
+        SUCCEEDED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, IID_PPV_ARGS(&d2dFactory))) &&
+        SUCCEEDED(d2dFactory->CreateDevice(dxgiDevice, &d2dDevice)) &&
+        SUCCEEDED(d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &baseContext)) &&
+        SUCCEEDED(baseContext->QueryInterface(IID_PPV_ARGS(&dc5))))
+    {
+        if (SUCCEEDED(CoCreateInstance(
+                CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(&wic))) &&
+            SUCCEEDED(wic->CreateStream(&stream)) &&
+            SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_READ)))
+        {
+            // Parse at a nominal size first just to read the document's
+            // own native width/height/viewBox, so the real render target
+            // can be sized to the actual aspect ratio instead of
+            // stretching/squishing it into a guessed box.
+            hr = dc5->CreateSvgDocument(stream, D2D1::SizeF(100, 100), &svgDoc);
+
+            if (SUCCEEDED(hr) && svgDoc)
+            {
+                float nativeW = 0, nativeH = 0;
+
+                ID2D1SvgElement* root = nullptr;
+                svgDoc->GetRoot(&root);
+
+                if (root)
+                {
+                    float w = 0, h = 0;
+
+                    bool haveW = SUCCEEDED(root->GetAttributeValue(L"width", &w));
+                    bool haveH = SUCCEEDED(root->GetAttributeValue(L"height", &h));
+
+                    if (haveW && haveH && w > 0 && h > 0)
+                    {
+                        nativeW = w;
+                        nativeH = h;
+                    }
+                    else
+                    {
+                        D2D1_SVG_VIEWBOX vb{};
+
+                        if (SUCCEEDED(root->GetAttributeValue(
+                                L"viewBox",
+                                D2D1_SVG_ATTRIBUTE_POD_TYPE_VIEWBOX,
+                                &vb, sizeof(vb))) &&
+                            vb.width > 0 && vb.height > 0)
+                        {
+                            nativeW = vb.width;
+                            nativeH = vb.height;
+                        }
+                    }
+
+                    root->Release();
+                }
+
+                if (nativeW <= 0 || nativeH <= 0)
+                {
+                    // SVG spec default when no size information at all.
+                    nativeW = 300;
+                    nativeH = 300;
+                }
+
+                SIZE targetSize =
+                    ScalePreviewImageSize(
+                        (int)nativeW, (int)nativeH,
+                        workAreaW, workAreaH);
+
+                svgDoc->SetViewportSize(
+                    D2D1::SizeF((float)targetSize.cx, (float)targetSize.cy));
+
+                D2D1_BITMAP_PROPERTIES1 targetProps =
+                    D2D1::BitmapProperties1(
+                        D2D1_BITMAP_OPTIONS_TARGET,
+                        D2D1::PixelFormat(
+                            DXGI_FORMAT_B8G8R8A8_UNORM,
+                            D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+                hr =
+                    dc5->CreateBitmap(
+                        D2D1::SizeU((UINT32)targetSize.cx, (UINT32)targetSize.cy),
+                        nullptr, 0, targetProps, &targetBitmap);
+
+                if (SUCCEEDED(hr) && targetBitmap)
+                {
+                    dc5->SetTarget(targetBitmap);
+                    dc5->BeginDraw();
+                    dc5->Clear(D2D1::ColorF(0, 0, 0, 0));
+                    dc5->DrawSvgDocument(svgDoc);
+                    hr = dc5->EndDraw();
+                }
+
+                if (SUCCEEDED(hr) && targetBitmap)
+                {
+                    D2D1_BITMAP_PROPERTIES1 stagingProps =
+                        D2D1::BitmapProperties1(
+                            D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                            D2D1::PixelFormat(
+                                DXGI_FORMAT_B8G8R8A8_UNORM,
+                                D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+                    hr =
+                        dc5->CreateBitmap(
+                            D2D1::SizeU((UINT32)targetSize.cx, (UINT32)targetSize.cy),
+                            nullptr, 0, stagingProps, &stagingBitmap);
+
+                    if (SUCCEEDED(hr) && stagingBitmap)
+                        hr = stagingBitmap->CopyFromBitmap(nullptr, targetBitmap, nullptr);
+
+                    D2D1_MAPPED_RECT mapped{};
+
+                    if (SUCCEEDED(hr) &&
+                        SUCCEEDED(stagingBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped)))
+                    {
+                        size_t bufSize = (size_t)mapped.pitch * targetSize.cy;
+                        BYTE* pixels = new BYTE[bufSize];
+
+                        memcpy(pixels, mapped.bits, bufSize);
+
+                        result =
+                            new Gdiplus::Bitmap(
+                                targetSize.cx, targetSize.cy, mapped.pitch,
+                                PixelFormat32bppPARGB, pixels);
+
+                        if (result->GetLastStatus() != Gdiplus::Ok)
+                        {
+                            delete result;
+                            delete[] pixels;
+                            result = nullptr;
+                        }
+                        else
+                        {
+                            *outPixels = pixels;
+                        }
+
+                        stagingBitmap->Unmap();
+                    }
+                }
+            }
+        }
+    }
+
+    if (stagingBitmap) stagingBitmap->Release();
+    if (targetBitmap) targetBitmap->Release();
+    if (svgDoc) svgDoc->Release();
+    if (stream) stream->Release();
+    if (wic) wic->Release();
+    if (dc5) dc5->Release();
+    if (baseContext) baseContext->Release();
+    if (d2dDevice) d2dDevice->Release();
+    if (d2dFactory) d2dFactory->Release();
+    if (dxgiDevice) dxgiDevice->Release();
+    d3dContext->Release();
+    d3dDevice->Release();
+
+    return result;
+}
+
+// Measured once per shown file (not per paint): total wrapped content
+// size at the panel's own mono-ish font, and the line height used both
+// for layout and for wheel-scroll clamping.
+static int g_previewContentW = 0;
+static int g_previewContentH = 0;
+static int g_previewLineHeight = S(18);
+
+// ------------------------------------------------------------------
+// JSON pretty-print + tokenizer
+// ------------------------------------------------------------------
+
+namespace
+{
+    // A small recursive-descent JSON re-serializer: parses just enough
+    // to re-emit the same document with 2-space indentation. Any parse
+    // failure aborts immediately (PrettyPrintJson returns false) so the
+    // caller falls back to the raw, unformatted text rather than risk
+    // emitting something mangled.
+    struct JsonPrettyPrinter
+    {
+        const std::wstring& s;
+        size_t pos = 0;
+        bool ok = true;
+
+        explicit JsonPrettyPrinter(const std::wstring& text) : s(text) {}
+
+        void SkipWs()
+        {
+            while (pos < s.size() && iswspace(s[pos]))
+                pos++;
+        }
+
+        void Indent(std::wstring& out, int depth)
+        {
+            out.append((size_t)depth * 2, L' ');
+        }
+
+        bool ParseString(std::wstring& out)
+        {
+            if (pos >= s.size() || s[pos] != L'"')
+            {
+                ok = false;
+                return false;
+            }
+
+            size_t start = pos;
+            pos++;
+
+            while (pos < s.size() && s[pos] != L'"')
+            {
+                if (s[pos] == L'\\' && pos + 1 < s.size())
+                    pos += 2;
+                else
+                    pos++;
+            }
+
+            if (pos >= s.size())
+            {
+                ok = false;
+                return false;
+            }
+
+            pos++; // closing quote
+            out.append(s, start, pos - start);
+            return true;
+        }
+
+        bool ParseNumber(std::wstring& out)
+        {
+            size_t start = pos;
+
+            if (s[pos] == L'-')
+                pos++;
+
+            while (pos < s.size() &&
+                   (iswdigit(s[pos]) || s[pos] == L'.' ||
+                    s[pos] == L'e' || s[pos] == L'E' ||
+                    s[pos] == L'+' || s[pos] == L'-'))
+            {
+                pos++;
+            }
+
+            if (pos == start)
+            {
+                ok = false;
+                return false;
+            }
+
+            out.append(s, start, pos - start);
+            return true;
+        }
+
+        bool ParseLiteral(std::wstring& out)
+        {
+            static const wchar_t* const literals[] = { L"true", L"false", L"null" };
+
+            for (const wchar_t* lit : literals)
+            {
+                size_t len = wcslen(lit);
+
+                if (s.compare(pos, len, lit) == 0)
+                {
+                    out.append(lit);
+                    pos += len;
+                    return true;
+                }
+            }
+
+            ok = false;
+            return false;
+        }
+
+        bool ParseValue(std::wstring& out, int depth)
+        {
+            SkipWs();
+
+            if (pos >= s.size())
+            {
+                ok = false;
+                return false;
+            }
+
+            wchar_t c = s[pos];
+
+            if (c == L'{') return ParseObject(out, depth);
+            if (c == L'[') return ParseArray(out, depth);
+            if (c == L'"') return ParseString(out);
+            if (c == L't' || c == L'f' || c == L'n') return ParseLiteral(out);
+            if (c == L'-' || iswdigit(c)) return ParseNumber(out);
+
+            ok = false;
+            return false;
+        }
+
+        bool ParseObject(std::wstring& out, int depth)
+        {
+            pos++; // {
+            SkipWs();
+
+            if (pos < s.size() && s[pos] == L'}')
+            {
+                pos++;
+                out += L"{}";
+                return true;
+            }
+
+            out += L"{\n";
+            bool first = true;
+
+            while (true)
+            {
+                if (!first) out += L",\n";
+                first = false;
+
+                SkipWs();
+                Indent(out, depth + 1);
+
+                if (pos >= s.size() || s[pos] != L'"')
+                {
+                    ok = false;
+                    return false;
+                }
+
+                if (!ParseString(out)) return false;
+
+                SkipWs();
+
+                if (pos >= s.size() || s[pos] != L':')
+                {
+                    ok = false;
+                    return false;
+                }
+
+                pos++;
+                out += L": ";
+
+                if (!ParseValue(out, depth + 1)) return false;
+
+                SkipWs();
+
+                if (pos < s.size() && s[pos] == L',') { pos++; continue; }
+                if (pos < s.size() && s[pos] == L'}') { pos++; break; }
+
+                ok = false;
+                return false;
+            }
+
+            out += L"\n";
+            Indent(out, depth);
+            out += L"}";
+            return true;
+        }
+
+        bool ParseArray(std::wstring& out, int depth)
+        {
+            pos++; // [
+            SkipWs();
+
+            if (pos < s.size() && s[pos] == L']')
+            {
+                pos++;
+                out += L"[]";
+                return true;
+            }
+
+            out += L"[\n";
+            bool first = true;
+
+            while (true)
+            {
+                if (!first) out += L",\n";
+                first = false;
+
+                SkipWs();
+                Indent(out, depth + 1);
+
+                if (!ParseValue(out, depth + 1)) return false;
+
+                SkipWs();
+
+                if (pos < s.size() && s[pos] == L',') { pos++; continue; }
+                if (pos < s.size() && s[pos] == L']') { pos++; break; }
+
+                ok = false;
+                return false;
+            }
+
+            out += L"\n";
+            Indent(out, depth);
+            out += L"]";
+            return true;
+        }
+    };
+}
+
+static bool PrettyPrintJson(
+    const std::wstring& raw,
+    std::wstring& outPretty)
+{
+    JsonPrettyPrinter printer(raw);
+    std::wstring out;
+
+    if (!printer.ParseValue(out, 0) || !printer.ok)
+        return false;
+
+    printer.SkipWs();
+
+    if (printer.pos != raw.size())
+        return false; // trailing garbage after the top-level value.
+
+    outPretty = out;
+    return true;
+}
+
+static void TokenizeJsonForHighlight(
+    const std::wstring& text,
+    std::vector<PreviewColorSpan>& spans)
+{
+    size_t i = 0;
+    size_t n = text.size();
+
+    while (i < n)
+    {
+        wchar_t c = text[i];
+
+        if (iswspace(c)) { i++; continue; }
+
+        if (c == L'"')
+        {
+            size_t start = i;
+            i++;
+
+            while (i < n && text[i] != L'"')
+            {
+                if (text[i] == L'\\' && i + 1 < n) i += 2;
+                else i++;
+            }
+
+            if (i < n) i++; // closing quote
+
+            size_t look = i;
+            while (look < n && iswspace(text[look])) look++;
+
+            PreviewTokenColor color =
+                (look < n && text[look] == L':')
+                    ? PreviewTokenColor::Key
+                    : PreviewTokenColor::String;
+
+            spans.push_back({ start, i - start, color });
+            continue;
+        }
+
+        if (c == L'-' || iswdigit(c))
+        {
+            size_t start = i;
+            i++;
+
+            while (i < n &&
+                   (iswdigit(text[i]) || text[i] == L'.' ||
+                    text[i] == L'e' || text[i] == L'E' ||
+                    text[i] == L'+' || text[i] == L'-'))
+            {
+                i++;
+            }
+
+            spans.push_back({ start, i - start, PreviewTokenColor::Number });
+            continue;
+        }
+
+        if (iswalpha(c))
+        {
+            size_t start = i;
+
+            while (i < n && iswalpha(text[i]))
+                i++;
+
+            std::wstring word = text.substr(start, i - start);
+
+            if (word == L"true" || word == L"false" || word == L"null")
+                spans.push_back({ start, i - start, PreviewTokenColor::Keyword });
+
+            continue;
+        }
+
+        if (c == L'{' || c == L'}' || c == L'[' || c == L']' ||
+            c == L':' || c == L',')
+        {
+            spans.push_back({ i, 1, PreviewTokenColor::Punctuation });
+            i++;
+            continue;
+        }
+
+        i++;
+    }
+}
+
+// ------------------------------------------------------------------
+// XML pretty-print + tokenizer
+// ------------------------------------------------------------------
+
+// Finds the end (exclusive) of the tag/comment/CDATA/declaration
+// starting at `start` (which must point at '<'), respecting quoted
+// attribute values so a '>' inside one doesn't end the tag early.
+// Returns std::wstring::npos if the construct is never closed.
+static size_t FindXmlTagEnd(
+    const std::wstring& text,
+    size_t start)
+{
+    size_t n = text.size();
+
+    if (text.compare(start, 4, L"<!--") == 0)
+    {
+        size_t end = text.find(L"-->", start);
+        return end == std::wstring::npos ? std::wstring::npos : end + 3;
+    }
+
+    if (text.compare(start, 9, L"<![CDATA[") == 0)
+    {
+        size_t end = text.find(L"]]>", start);
+        return end == std::wstring::npos ? std::wstring::npos : end + 3;
+    }
+
+    size_t j = start + 1;
+    bool inQuote = false;
+    wchar_t quoteChar = 0;
+
+    while (j < n)
+    {
+        wchar_t c = text[j];
+
+        if (inQuote)
+        {
+            if (c == quoteChar) inQuote = false;
+        }
+        else
+        {
+            if (c == L'"' || c == L'\'') { inQuote = true; quoteChar = c; }
+            else if (c == L'>') return j + 1;
+        }
+
+        j++;
+    }
+
+    return std::wstring::npos;
+}
+
+static bool PrettyPrintXml(
+    const std::wstring& raw,
+    std::wstring& outPretty)
+{
+    std::wstring out;
+    int depth = 0;
+    size_t i = 0;
+    size_t n = raw.size();
+
+    while (i < n)
+    {
+        if (raw[i] == L'<')
+        {
+            size_t tagEnd = FindXmlTagEnd(raw, i);
+
+            if (tagEnd == std::wstring::npos)
+                return false;
+
+            std::wstring tag = raw.substr(i, tagEnd - i);
+
+            bool isClosing = tag.size() > 1 && tag[1] == L'/';
+            bool isSelfClosing = tag.size() > 2 && tag[tag.size() - 2] == L'/';
+            bool isSpecial =
+                tag.compare(0, 4, L"<!--") == 0 ||
+                tag.compare(0, 9, L"<![CDATA[") == 0 ||
+                tag.compare(0, 2, L"<?") == 0 ||
+                tag.compare(0, 2, L"<!") == 0;
+
+            if (isClosing && depth > 0)
+                depth--;
+
+            out.append((size_t)depth * 2, L' ');
+            out += tag;
+            out += L'\n';
+
+            if (!isClosing && !isSelfClosing && !isSpecial)
+                depth++;
+
+            i = tagEnd;
+        }
+        else
+        {
+            size_t textStart = i;
+            size_t nextTag = raw.find(L'<', i);
+            size_t textEnd = (nextTag == std::wstring::npos) ? n : nextTag;
+
+            std::wstring trimmed = Trim(raw.substr(textStart, textEnd - textStart));
+
+            if (!trimmed.empty())
+            {
+                out.append((size_t)depth * 2, L' ');
+                out += trimmed;
+                out += L'\n';
+            }
+
+            i = textEnd;
+        }
+    }
+
+    if (depth != 0)
+        return false; // mismatched tags — fail safe to raw text.
+
+    outPretty = out;
+    return true;
+}
+
+static void TokenizeXmlForHighlight(
+    const std::wstring& text,
+    std::vector<PreviewColorSpan>& spans)
+{
+    size_t i = 0;
+    size_t n = text.size();
+
+    while (i < n)
+    {
+        if (text[i] != L'<')
+        {
+            i++;
+            continue;
+        }
+
+        size_t tagStart = i;
+
+        if (text.compare(i, 4, L"<!--") == 0)
+        {
+            size_t end = text.find(L"-->", i);
+            end = (end == std::wstring::npos) ? n : end + 3;
+            spans.push_back({ tagStart, end - tagStart, PreviewTokenColor::Comment });
+            i = end;
+            continue;
+        }
+
+        size_t tagEnd = FindXmlTagEnd(text, i);
+
+        if (tagEnd == std::wstring::npos)
+        {
+            i++;
+            continue;
+        }
+
+        spans.push_back({ tagStart, 1, PreviewTokenColor::Punctuation });
+
+        size_t nameStart = tagStart + 1;
+
+        if (nameStart < tagEnd && text[nameStart] == L'/')
+            nameStart++;
+
+        size_t nameEnd = nameStart;
+
+        while (nameEnd < tagEnd &&
+               (iswalnum(text[nameEnd]) || text[nameEnd] == L'_' ||
+                text[nameEnd] == L'-' || text[nameEnd] == L':' ||
+                text[nameEnd] == L'.'))
+        {
+            nameEnd++;
+        }
+
+        if (nameEnd > nameStart)
+            spans.push_back({ nameStart, nameEnd - nameStart, PreviewTokenColor::TagName });
+
+        size_t k = nameEnd;
+
+        while (k < tagEnd)
+        {
+            while (k < tagEnd && iswspace(text[k])) k++;
+
+            if (k >= tagEnd || text[k] == L'/' || text[k] == L'>')
+                break;
+
+            size_t attrStart = k;
+
+            while (k < tagEnd && text[k] != L'=' &&
+                   !iswspace(text[k]) && text[k] != L'>' && text[k] != L'/')
+            {
+                k++;
+            }
+
+            if (k > attrStart)
+                spans.push_back({ attrStart, k - attrStart, PreviewTokenColor::AttrName });
+
+            while (k < tagEnd && iswspace(text[k])) k++;
+
+            if (k < tagEnd && text[k] == L'=')
+            {
+                k++;
+
+                while (k < tagEnd && iswspace(text[k])) k++;
+
+                if (k < tagEnd && (text[k] == L'"' || text[k] == L'\''))
+                {
+                    wchar_t q = text[k];
+                    size_t valStart = k;
+                    k++;
+
+                    while (k < tagEnd && text[k] != q) k++;
+                    if (k < tagEnd) k++;
+
+                    spans.push_back({ valStart, k - valStart, PreviewTokenColor::AttrValue });
+                }
+            }
+        }
+
+        i = tagEnd;
+    }
+}
+
+static COLORREF PreviewTokenRGB(
+    PreviewTokenColor color)
+{
+    switch (color)
+    {
+        case PreviewTokenColor::Key:         return RGB(156, 220, 254);
+        case PreviewTokenColor::String:      return RGB(206, 145, 120);
+        case PreviewTokenColor::Number:      return RGB(181, 206, 168);
+        case PreviewTokenColor::Keyword:     return RGB(86, 156, 214);
+        case PreviewTokenColor::Punctuation: return g_muted;
+        case PreviewTokenColor::TagName:     return RGB(86, 156, 214);
+        case PreviewTokenColor::AttrName:    return RGB(156, 220, 254);
+        case PreviewTokenColor::AttrValue:   return RGB(206, 145, 120);
+        case PreviewTokenColor::Comment:     return RGB(106, 153, 85);
+        default:                             return g_text;
+    }
+}
+
+// ------------------------------------------------------------------
+// Word-wrap
+// ------------------------------------------------------------------
+
+// Greedy word-wrap of g_previewText into display lines no wider than
+// targetWidth, preferring to break at the last space within reach so
+// words don't split mid-token except when a single unbroken run (a long
+// URL, a minified attribute value) genuinely has nowhere else to break.
+static void WrapPreviewText(
+    int targetWidth)
+{
+    g_previewDisplayLines.clear();
+
+    HDC dc = GetDC(nullptr);
+
+    if (!dc)
+        return;
+
+    HGDIOBJ old = SelectObject(dc, g_font);
+
+    size_t pos = 0;
+    size_t n = g_previewText.size();
+
+    while (pos <= n)
+    {
+        size_t nl = g_previewText.find(L'\n', pos);
+        size_t lineEnd = (nl == std::wstring::npos) ? n : nl;
+
+        size_t segStart = pos;
+
+        if (segStart == lineEnd)
+        {
+            g_previewDisplayLines.push_back({ segStart, 0 });
+        }
+        else
+        {
+            while (segStart < lineEnd)
+            {
+                int available = (int)(lineEnd - segStart);
+                int fitChars = 0;
+                SIZE sz{};
+
+                GetTextExtentExPointW(
+                    dc,
+                    g_previewText.c_str() + segStart,
+                    available,
+                    targetWidth,
+                    &fitChars,
+                    nullptr,
+                    &sz);
+
+                if (fitChars <= 0)
+                    fitChars = 1; // always make progress
+
+                size_t breakAt = segStart + (size_t)fitChars;
+
+                if (breakAt < lineEnd)
+                {
+                    size_t lastSpace = std::wstring::npos;
+
+                    for (size_t k = breakAt; k > segStart; --k)
+                    {
+                        if (g_previewText[k - 1] == L' ')
+                        {
+                            lastSpace = k - 1;
+                            break;
+                        }
+                    }
+
+                    if (lastSpace != std::wstring::npos && lastSpace > segStart)
+                        breakAt = lastSpace;
+                }
+
+                size_t displayLen = breakAt - segStart;
+                g_previewDisplayLines.push_back({ segStart, displayLen });
+
+                size_t next = breakAt;
+
+                if (next < lineEnd && g_previewText[next] == L' ')
+                    next++;
+
+                segStart = next;
+            }
+        }
+
+        if (nl == std::wstring::npos)
+            break;
+
+        pos = nl + 1;
+    }
+
+    SelectObject(dc, old);
+    ReleaseDC(nullptr, dc);
+}
+
+// Orchestrates layout for the currently-loaded g_previewText: measures
+// line height, picks the fixed target width (so the panel reads as a
+// clean, compact rectangle regardless of content), word-wraps to it, and
+// derives the total content height from the wrapped line count.
+static void LayoutPreviewText(
+    int workAreaW)
+{
+    HDC dc = GetDC(nullptr);
+
+    if (dc)
+    {
+        HGDIOBJ old = SelectObject(dc, g_font);
+
+        TEXTMETRICW tm{};
+        GetTextMetricsW(dc, &tm);
+        g_previewLineHeight = tm.tmHeight + tm.tmExternalLeading;
+
+        SelectObject(dc, old);
+        ReleaseDC(nullptr, dc);
+    }
+
+    g_previewContentW = PreviewTextTargetWidth(workAreaW, S(300), S(560));
+
+    WrapPreviewText(g_previewContentW);
+
+    g_previewContentH = (int)g_previewDisplayLines.size() * g_previewLineHeight;
+}
+
+static RECT GetPreviewRect()
+{
+    RECT work{};
+
+    if (!GetWorkArea(work))
+        work = { 0, 0, 1920, 1080 };
+
+    int margin = S(8);
+    int w, h;
+
+    if (g_previewKind == PreviewKind::Image)
+    {
+        w = g_previewImageW;
+        h = g_previewImageH;
+    }
+    else
+    {
+        SIZE clamped =
+            ClampPreviewTextSize(
+                g_previewContentW + S(24),
+                g_previewContentH + S(24),
+                work.right - work.left,
+                work.bottom - work.top);
+
+        w = clamped.cx;
+        h = clamped.cy;
+    }
+
+    return
+    {
+        work.right - margin - w,
+        work.top + margin,
+        work.right - margin,
+        work.top + margin + h
+    };
+}
+
+static void ApplyPreviewAlpha()
+{
+    if (!g_preview)
+        return;
+
+    SetLayeredWindowAttributes(
+        g_preview, 0,
+        (BYTE)(PREVIEW_BASE_ALPHA * g_previewAlpha),
+        LWA_ALPHA);
+}
+
+static void CancelPreviewFadeOut()
+{
+    if (g_previewFadeTimer)
+    {
+        KillTimer(g_preview, TIMER_PREVIEW_FADE);
+        g_previewFadeTimer = 0;
+    }
+
+    g_previewAlpha = 1.0f;
+    ApplyPreviewAlpha();
+}
+
+static void BeginPreviewFadeOut()
+{
+    if (g_previewFadeTimer || g_previewKind == PreviewKind::None || !g_preview)
+        return;
+
+    g_previewFadeStartTick = GetTickCount();
+
+    g_previewFadeTimer =
+        SetTimer(g_preview, TIMER_PREVIEW_FADE, 16, nullptr);
+}
+
+static void ClearPreviewContent()
+{
+    if (g_previewImage)
+    {
+        delete g_previewImage;
+        g_previewImage = nullptr;
+    }
+
+    if (g_previewImagePixels)
+    {
+        delete[] g_previewImagePixels;
+        g_previewImagePixels = nullptr;
+    }
+
+    g_previewText.clear();
+    g_previewTextTruncated = false;
+    g_previewTextScroll = 0;
+    g_previewKind = PreviewKind::None;
+    g_previewPath.clear();
+    g_previewImageW = 0;
+    g_previewImageH = 0;
+    g_previewContentW = 0;
+    g_previewContentH = 0;
+    g_previewHighlightLang = PreviewHighlightLang::None;
+    g_previewColorSpans.clear();
+    g_previewDisplayLines.clear();
+}
+
+static void HidePreview()
+{
+    if (g_previewFadeTimer)
+    {
+        KillTimer(g_preview, TIMER_PREVIEW_FADE);
+        g_previewFadeTimer = 0;
+    }
+
+    if (g_previewShowTimer)
+    {
+        KillTimer(g_searchPanel, TIMER_PREVIEW_HOVER);
+        g_previewShowTimer = 0;
+    }
+
+    if (g_preview)
+        ShowWindow(g_preview, SW_HIDE);
+
+    ClearPreviewContent();
+    g_previewHoverIndex = -1;
+}
+
+// Loads and shows a hover preview for g_searchResults[index]. Not fatal
+// on any failure along the way — an unsupported/unreadable file just
+// means no preview appears, the search results themselves are unaffected.
+static void ShowPreviewForResult(int index)
+{
+    if (!g_preview)
+        return;
+
+    if (index < 0 || index >= (int)g_searchResults.size())
+        return;
+
+    const SearchResultEntry& entry = g_searchResults[index];
+
+    if (entry.kind != SearchResultKind::File)
+    {
+        HidePreview();
+        return;
+    }
+
+    std::wstring path;
+
+    {
+        std::lock_guard<std::mutex> lock(g_fileIndexMutex);
+
+        if (entry.fileIndex < g_fileIndex.size())
+            path = g_fileIndex[entry.fileIndex].fullPath;
+    }
+
+    if (path.empty())
+        return;
+
+    bool isSvg = false;
+    PreviewKind kind = ClassifyPreview(path, isSvg);
+
+    if (kind == PreviewKind::None)
+    {
+        HidePreview();
+        return;
+    }
+
+    ClearPreviewContent();
+
+    RECT work{};
+
+    if (!GetWorkArea(work))
+        work = { 0, 0, 1920, 1080 };
+
+    int workW = work.right - work.left;
+    int workH = work.bottom - work.top;
+
+    if (kind == PreviewKind::Text)
+    {
+        if (!LoadPreviewTextFile(path, g_previewText, g_previewTextTruncated))
+            return;
+
+        std::wstring ext = FileExtensionLower(path);
+
+        if (ext == L"json")
+        {
+            std::wstring pretty;
+
+            if (PrettyPrintJson(g_previewText, pretty))
+            {
+                g_previewText = pretty;
+                g_previewHighlightLang = PreviewHighlightLang::Json;
+                TokenizeJsonForHighlight(g_previewText, g_previewColorSpans);
+            }
+            // On parse failure, g_previewText stays as the raw text and
+            // g_previewHighlightLang stays None — fail safe to a plain,
+            // unhighlighted view rather than risk mangling the content.
+        }
+        else if (ext == L"xml")
+        {
+            std::wstring pretty;
+
+            if (PrettyPrintXml(g_previewText, pretty))
+            {
+                g_previewText = pretty;
+                g_previewHighlightLang = PreviewHighlightLang::Xml;
+                TokenizeXmlForHighlight(g_previewText, g_previewColorSpans);
+            }
+        }
+
+        LayoutPreviewText(workW);
+        g_previewKind = PreviewKind::Text;
+    }
+    else
+    {
+        Gdiplus::Bitmap* bmp = nullptr;
+
+        if (isSvg)
+        {
+            BYTE* pixels = nullptr;
+            bmp = RenderSvgToBitmap(path, workW, workH, &pixels);
+            g_previewImagePixels = pixels;
+        }
+        else
+        {
+            bmp = LoadPreviewImageFile(path);
+        }
+
+        if (!bmp)
+        {
+            if (g_previewImagePixels)
+            {
+                delete[] g_previewImagePixels;
+                g_previewImagePixels = nullptr;
+            }
+
+            return;
+        }
+
+        g_previewImage = bmp;
+
+        int nativeW = (int)bmp->GetWidth();
+        int nativeH = (int)bmp->GetHeight();
+
+        // SVGs are already rendered at their final target size by
+        // RenderSvgToBitmap; raster images still need scaling here.
+        if (isSvg)
+        {
+            g_previewImageW = nativeW;
+            g_previewImageH = nativeH;
+        }
+        else
+        {
+            SIZE scaled = ScalePreviewImageSize(nativeW, nativeH, workW, workH);
+            g_previewImageW = scaled.cx;
+            g_previewImageH = scaled.cy;
+        }
+
+        g_previewKind = PreviewKind::Image;
+    }
+
+    g_previewPath = path;
+
+    RECT r = GetPreviewRect();
+
+    SetWindowPos(
+        g_preview, HWND_TOPMOST,
+        r.left, r.top,
+        r.right - r.left, r.bottom - r.top,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+    g_previewAlpha = 1.0f;
+    ApplyPreviewAlpha();
+
+    InvalidateRect(g_preview, nullptr, FALSE);
+}
+
+static void PaintPreview(
+    HWND hwnd,
+    HDC dc)
+{
+    RECT client{};
+    GetClientRect(hwnd, &client);
+
+    int width = client.right;
+    int height = client.bottom;
+
+    HDC back = CreateCompatibleDC(dc);
+
+    if (!back)
+        return;
+
+    HBITMAP bitmap = CreateCompatibleBitmap(dc, width, height);
+
+    if (!bitmap)
+    {
+        DeleteDC(back);
+        return;
+    }
+
+    HGDIOBJ old = SelectObject(back, bitmap);
+
+    FillRectColor(back, client, g_bg);
+    DrawRoundBorder(back, client, S(18), g_border);
+
+    if (g_previewKind == PreviewKind::Image && g_previewImage)
+    {
+        Gdiplus::Graphics graphics(back);
+
+        graphics.SetInterpolationMode(
+            Gdiplus::InterpolationModeHighQualityBicubic);
+
+        graphics.DrawImage(
+            g_previewImage, 0, 0, width, height);
+    }
+    else if (g_previewKind == PreviewKind::Text)
+    {
+        SetBkMode(back, TRANSPARENT);
+        HGDIOBJ oldFont = SelectObject(back, g_font);
+
+        size_t spanCursor = 0;
+        int y = S(10) - g_previewTextScroll;
+
+        for (const PreviewDisplayLine& line : g_previewDisplayLines)
+        {
+            int x = S(10);
+            size_t pos = line.start;
+            size_t lineEnd = line.start + line.length;
+
+            // Always walks the full line (even when scrolled off-screen
+            // above/below the client rect) so spanCursor stays correctly
+            // positioned for the next line — GDI itself clips any actual
+            // drawing outside the target bitmap, so this costs a little
+            // wasted measurement on off-screen lines rather than complex
+            // bookkeeping to skip them.
+            while (pos < lineEnd || (pos == lineEnd && line.length == 0))
+            {
+                while (spanCursor < g_previewColorSpans.size() &&
+                       g_previewColorSpans[spanCursor].start +
+                               g_previewColorSpans[spanCursor].length <= pos)
+                {
+                    spanCursor++;
+                }
+
+                size_t runEnd = lineEnd;
+                COLORREF runColor = g_text;
+
+                if (spanCursor < g_previewColorSpans.size())
+                {
+                    const PreviewColorSpan& span = g_previewColorSpans[spanCursor];
+
+                    if (span.start <= pos)
+                    {
+                        runEnd = std::min(lineEnd, span.start + span.length);
+                        runColor = PreviewTokenRGB(span.color);
+                    }
+                    else
+                    {
+                        runEnd = std::min(lineEnd, span.start);
+                    }
+                }
+
+                if (runEnd > pos)
+                {
+                    SetTextColor(back, runColor);
+
+                    RECT r = { x, y, x + 10000, y + g_previewLineHeight };
+
+                    DrawTextW(
+                        back,
+                        g_previewText.c_str() + pos,
+                        (int)(runEnd - pos),
+                        &r,
+                        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+
+                    SIZE sz{};
+
+                    GetTextExtentPoint32W(
+                        back, g_previewText.c_str() + pos, (int)(runEnd - pos), &sz);
+
+                    x += sz.cx;
+                }
+
+                if (runEnd == pos)
+                    break; // empty line
+
+                pos = runEnd;
+            }
+
+            y += g_previewLineHeight;
+        }
+
+        SelectObject(back, oldFont);
+
+        if (g_previewTextTruncated)
+        {
+            RECT tr = { S(10), height - S(20), width - S(10), height - S(4) };
+
+            DrawTextSimple(
+                back, L"(truncated)",
+                tr.left, tr.top,
+                tr.right - tr.left, tr.bottom - tr.top,
+                g_muted, g_small,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
+
+    BitBlt(dc, 0, 0, width, height, back, 0, 0, SRCCOPY);
+
+    SelectObject(back, old);
+    DeleteObject(bitmap);
+    DeleteDC(back);
+}
+
+static LRESULT CALLBACK PreviewProc(
+    HWND hwnd,
+    UINT msg,
+    WPARAM wp,
+    LPARAM lp)
+{
+    switch (msg)
+    {
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_PAINT:
+        {
+            PAINTSTRUCT ps{};
+            HDC dc = BeginPaint(hwnd, &ps);
+
+            if (dc)
+                PaintPreview(hwnd, dc);
+
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        case WM_MOUSEMOVE:
+        {
+            CancelPreviewFadeOut();
+
+            TRACKMOUSEEVENT tme{};
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            TrackMouseEvent(&tme);
+
+            return 0;
+        }
+
+        case WM_MOUSELEAVE:
+            BeginPreviewFadeOut();
+            return 0;
+
+        case WM_MOUSEWHEEL:
+        {
+            if (g_previewKind != PreviewKind::Text)
+                return 0;
+
+            int delta = GET_WHEEL_DELTA_WPARAM(wp);
+
+            g_previewTextScroll -=
+                (delta / WHEEL_DELTA) * 3 * g_previewLineHeight;
+
+            RECT client{};
+            GetClientRect(hwnd, &client);
+
+            int maxScroll =
+                g_previewContentH - (client.bottom - S(20));
+
+            if (maxScroll < 0)
+                maxScroll = 0;
+
+            if (g_previewTextScroll < 0)
+                g_previewTextScroll = 0;
+
+            if (g_previewTextScroll > maxScroll)
+                g_previewTextScroll = maxScroll;
+
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_TIMER:
+        {
+            if (wp == TIMER_PREVIEW_FADE)
+            {
+                DWORD elapsed = GetTickCount() - g_previewFadeStartTick;
+
+                if (elapsed < (DWORD)PREVIEW_FADE_GRACE_MS)
+                    return 0;
+
+                DWORD fadeElapsed = elapsed - PREVIEW_FADE_GRACE_MS;
+
+                if (fadeElapsed >= (DWORD)PREVIEW_FADE_DURATION_MS)
+                {
+                    KillTimer(hwnd, TIMER_PREVIEW_FADE);
+                    g_previewFadeTimer = 0;
+                    HidePreview();
+                    return 0;
+                }
+
+                g_previewAlpha =
+                    1.0f - (float)fadeElapsed / (float)PREVIEW_FADE_DURATION_MS;
+
+                ApplyPreviewAlpha();
+                return 0;
+            }
+
+            break;
+        }
+    }
+
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static bool CreatePreviewWindow(
+    HINSTANCE instance)
+{
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = PreviewProc;
+    wc.hInstance = instance;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = PREVIEW_CLASS;
+
+    if (!RegisterClassExW(&wc) &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    {
+        return false;
+    }
+
+    g_preview =
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
+            PREVIEW_CLASS,
+            L"ClassicShell Preview",
+            WS_POPUP,
+            0, 0, 10, 10,
+            nullptr, nullptr, instance, nullptr);
+
+    if (!g_preview)
+        return false;
+
+    SetLayeredWindowAttributes(g_preview, 0, PREVIEW_BASE_ALPHA, LWA_ALPHA);
+    ApplyWindowRounding(g_preview);
+
+    return true;
 }
 
 static RECT GetPowerButtonRect(
@@ -3851,6 +6781,8 @@ static void CloseStart()
 
     g_hover = -1;
     g_powerHover = -1;
+
+    RepositionSearchPanel();
 }
 
 // Runs whatever a menu item does, shared by mouse clicks and
@@ -3890,6 +6822,15 @@ static void ActivateItem(
         return;
     }
 
+    // A disclosure, not a launcher: toggles the full God Mode Control
+    // Panel listing into the search results panel, keeping the menu
+    // open rather than closing it like every other item.
+    if (command == L"control panel")
+    {
+        ToggleControlPanelBrowse();
+        return;
+    }
+
     ExecuteSmartInput(
         command);
 
@@ -3904,6 +6845,7 @@ enum class FocusKind
 {
     None,
     Search,
+    SearchResult,
     Item,
     Tool,
     Slider,
@@ -3919,9 +6861,10 @@ struct FocusTarget
 
 static int FocusCount()
 {
-    // search + items + quick tools + slider + power
+    // search + search results + items + quick tools + slider + power
     int n =
         1 +
+        (int)g_searchResults.size() +
         g_itemCount +
         g_quickToolCount +
         1 +
@@ -3949,6 +6892,11 @@ static FocusTarget ResolveFocus(
         return { FocusKind::Search, 0 };
 
     flat -= 1;
+
+    if (flat < (int)g_searchResults.size())
+        return { FocusKind::SearchResult, flat };
+
+    flat -= (int)g_searchResults.size();
 
     if (flat < g_itemCount)
         return { FocusKind::Item, flat };
@@ -4044,6 +6992,10 @@ static void ActivateFocus(
             HandleSearchEnter();
             break;
 
+        case FocusKind::SearchResult:
+            LaunchSearchResult((size_t)t.index);
+            break;
+
         case FocusKind::Item:
             ActivateItem(
                 t.index);
@@ -4082,6 +7034,19 @@ static void ActivateFocus(
         hwnd,
         nullptr,
         FALSE);
+}
+
+// Lets the search panel's own paint routine (defined earlier in the
+// file, before FocusKind exists) know which row, if any, is the current
+// keyboard-focus target, without needing the enum itself in scope there.
+static int GetFocusedSearchResultIndex()
+{
+    FocusTarget t = ResolveFocus(g_focusIndex);
+
+    return
+        t.kind == FocusKind::SearchResult
+            ? t.index
+            : -1;
 }
 
 static void AdjustFocusedSlider(
@@ -4656,53 +7621,109 @@ static void PaintStart(
             g_accent,
             g_bold);
 
-        DrawTextSimple(
-            back,
-            g_searchText.c_str(),
-            S(46),
-            search.top,
-            width - S(58),
-            S(48),
-            g_text,
-            g_font);
-
-        // Blinking text-entry caret, right after the typed text.
-        if (g_caretVisible)
+        // Text + caret + selection highlight. Measured all together
+        // under one font selection (each DrawTextSimple call below
+        // manages its own selection independently, so this doesn't need
+        // to stay selected across them), then drawn as up to three runs
+        // — before/inside/after the selection — so the selected portion
+        // reads with contrast against its accent-colored highlight the
+        // same way a native textbox would, instead of the caret always
+        // being pinned to the end of the text regardless of where it
+        // actually is.
         {
+            int caretPos = g_searchSelection.Caret();
+            bool hasSelection = g_searchSelection.HasSelection();
+            int selStart = hasSelection ? g_searchSelection.SelectionStart() : caretPos;
+            int selEnd = hasSelection ? g_searchSelection.SelectionEnd() : caretPos;
+
             HGDIOBJ oldFont =
-                SelectObject(
-                    back,
-                    g_font);
+                SelectObject(back, g_font);
 
-            SIZE textSize{ 0, 0 };
-
+            SIZE beforeSize{};
             GetTextExtentPoint32W(
-                back,
-                g_searchText.c_str(),
-                (int)g_searchText.size(),
-                &textSize);
+                back, g_searchText.c_str(), selStart, &beforeSize);
 
-            SelectObject(
-                back,
-                oldFont);
-
-            int caretX =
-                S(46) +
-                textSize.cx +
-                S(3);
-
-            RECT caret =
+            SIZE selSize{};
+            if (hasSelection)
             {
-                caretX,
-                search.top + S(9),
-                caretX + S(2),
-                search.top + S(39)
-            };
+                GetTextExtentPoint32W(
+                    back, g_searchText.c_str() + selStart,
+                    selEnd - selStart, &selSize);
+            }
 
-            FillRectColor(
-                back,
-                caret,
-                g_accent);
+            SIZE toCaretSize{};
+            GetTextExtentPoint32W(
+                back, g_searchText.c_str(), caretPos, &toCaretSize);
+
+            SelectObject(back, oldFont);
+
+            if (hasSelection)
+            {
+                RECT selRect =
+                {
+                    S(46) + beforeSize.cx,
+                    search.top + S(9),
+                    S(46) + beforeSize.cx + selSize.cx,
+                    search.top + S(39)
+                };
+
+                FillRectColor(back, selRect, g_accent);
+            }
+
+            if (selStart > 0)
+            {
+                std::wstring before = g_searchText.substr(0, selStart);
+
+                DrawTextSimple(
+                    back, before.c_str(),
+                    S(46), search.top,
+                    width - S(58), S(48),
+                    g_text, g_font);
+            }
+
+            if (hasSelection)
+            {
+                std::wstring selected =
+                    g_searchText.substr(selStart, selEnd - selStart);
+
+                DrawTextSimple(
+                    back, selected.c_str(),
+                    S(46) + beforeSize.cx, search.top,
+                    width - S(58) - beforeSize.cx, S(48),
+                    g_accentText, g_font);
+            }
+
+            if ((size_t)selEnd < g_searchText.size())
+            {
+                SIZE toSelEndSize{};
+
+                HGDIOBJ oldFont2 = SelectObject(back, g_font);
+                GetTextExtentPoint32W(
+                    back, g_searchText.c_str(), selEnd, &toSelEndSize);
+                SelectObject(back, oldFont2);
+
+                DrawTextSimple(
+                    back, g_searchText.c_str() + selEnd,
+                    S(46) + toSelEndSize.cx, search.top,
+                    width - S(58) - toSelEndSize.cx, S(48),
+                    g_text, g_font);
+            }
+
+            // Blinking text-entry caret, at its actual position.
+            if (g_caretVisible)
+            {
+                int caretX = S(46) + toCaretSize.cx + S(3);
+
+                RECT caret =
+                {
+                    caretX,
+                    search.top + S(9),
+                    caretX + S(2),
+                    search.top + S(39)
+                };
+
+                FillRectColor(back, caret, g_accent);
+            }
         }
     }
 
@@ -5381,6 +8402,11 @@ static LRESULT CALLBACK StartProc(
                         point) ==
                         TRUE);
 
+            if (g_searchDragging)
+            {
+                PlaceSearchCaretFromPoint(hwnd, S(46), x, true);
+            }
+
             int oldToolHover =
                 g_quickToolHover;
 
@@ -5548,6 +8574,32 @@ static LRESULT CALLBACK StartProc(
                 return 0;
             }
 
+            // Search box — click-to-place-caret, drag-to-select.
+            if (!g_searchText.empty())
+            {
+                RECT search =
+                    GetSearchRect(client.right);
+
+                POINT searchPoint{ x, y };
+
+                if (PtInRect(&search, searchPoint))
+                {
+                    bool shift =
+                        (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+                    PlaceSearchCaretFromPoint(hwnd, S(46), x, shift);
+
+                    g_searchDragging = true;
+                    SetCapture(hwnd);
+
+                    g_focusIndex = 0; // FocusKind::Search is always flat index 0.
+
+                    InvalidateRect(hwnd, nullptr, FALSE);
+
+                    return 0;
+                }
+            }
+
             // Power flyout action.
             int powerAction =
                 HitPowerAction(
@@ -5633,11 +8685,48 @@ static LRESULT CALLBACK StartProc(
             return 0;
         }
 
+        case WM_LBUTTONDBLCLK:
+        {
+            int x =
+                (int)(short)LOWORD(lp);
+
+            int y =
+                (int)(short)HIWORD(lp);
+
+            if (!g_searchText.empty())
+            {
+                RECT client{};
+                GetClientRect(hwnd, &client);
+
+                RECT search =
+                    GetSearchRect(client.right);
+
+                POINT searchPoint{ x, y };
+
+                if (PtInRect(&search, searchPoint))
+                {
+                    SelectSearchWordAtPoint(hwnd, S(46), x);
+                    return 0;
+                }
+            }
+
+            break;
+        }
+
         case WM_LBUTTONUP:
         {
             if (g_sliderDragging)
             {
                 g_sliderDragging = false;
+
+                ReleaseCapture();
+
+                return 0;
+            }
+
+            if (g_searchDragging)
+            {
+                g_searchDragging = false;
 
                 ReleaseCapture();
 
@@ -5650,6 +8739,7 @@ static LRESULT CALLBACK StartProc(
         case WM_CAPTURECHANGED:
         {
             g_sliderDragging = false;
+            g_searchDragging = false;
 
             return 0;
         }
@@ -5749,15 +8839,59 @@ static LRESULT CALLBACK StartProc(
             }
 
             if (wp == VK_LEFT ||
-                wp == VK_RIGHT)
+                wp == VK_RIGHT ||
+                wp == VK_HOME ||
+                wp == VK_END)
             {
-                AdjustFocusedSlider(
-                    hwnd,
-                    wp == VK_RIGHT
-                        ? 1
-                        : -1);
+                FocusTarget t =
+                    ResolveFocus(g_focusIndex);
+
+                bool searchActive =
+                    g_focusIndex < 0 ||
+                    t.kind == FocusKind::Search;
+
+                if (searchActive)
+                {
+                    bool shift =
+                        (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+                    HandleSearchBoxNavigationKey(
+                        hwnd, (DWORD)wp, false, shift);
+
+                    return 0;
+                }
+
+                if (wp == VK_LEFT || wp == VK_RIGHT)
+                {
+                    AdjustFocusedSlider(
+                        hwnd,
+                        wp == VK_RIGHT
+                            ? 1
+                            : -1);
+                }
 
                 return 0;
+            }
+
+            if ((wp == 'A' || wp == 'C') &&
+                (GetKeyState(VK_CONTROL) & 0x8000))
+            {
+                FocusTarget t =
+                    ResolveFocus(g_focusIndex);
+
+                bool searchActive =
+                    g_focusIndex < 0 ||
+                    t.kind == FocusKind::Search;
+
+                if (searchActive)
+                {
+                    HandleSearchBoxNavigationKey(
+                        hwnd, (DWORD)wp, true, false);
+
+                    return 0;
+                }
+
+                break;
             }
 
             if (wp == VK_RETURN)
@@ -5802,24 +8936,13 @@ static LRESULT CALLBACK StartProc(
 
             if (wp == VK_BACK)
             {
-                if (!g_searchText.empty())
-                {
-                    g_searchText.pop_back();
+                DeleteSearchSelectionOrCharBefore(hwnd);
+                return 0;
+            }
 
-                    g_caretVisible = true;
-
-                    if (g_searchText.empty())
-                    {
-                        ResizeStartToContent(
-                            hwnd);
-                    }
-
-                    InvalidateRect(
-                        hwnd,
-                        nullptr,
-                        FALSE);
-                }
-
+            if (wp == VK_DELETE)
+            {
+                DeleteSearchSelectionOrCharAfter(hwnd);
                 return 0;
             }
 
@@ -5844,24 +8967,7 @@ static LRESULT CALLBACK StartProc(
                 c >= 32 &&
                 c != 127)
             {
-                bool wasEmpty =
-                    g_searchText.empty();
-
-                g_searchText += c;
-
-                g_caretVisible = true;
-
-                if (wasEmpty)
-                {
-                    ResizeStartToContent(
-                        hwnd);
-                }
-
-                InvalidateRect(
-                    hwnd,
-                    nullptr,
-                    FALSE);
-
+                InsertSearchChar(hwnd, c);
                 return 0;
             }
 
@@ -6030,7 +9136,8 @@ static bool CreateStartWindow(
 
     wc.style =
         CS_HREDRAW |
-        CS_VREDRAW;
+        CS_VREDRAW |
+        CS_DBLCLKS;
 
     wc.lpfnWndProc =
         StartProc;
@@ -6107,6 +9214,19 @@ static void ShowStart()
     if (!g_start)
         return;
 
+    // Every fresh open starts clean: stale search text and any leftover
+    // results/God Mode browse listing from a previous session must not
+    // survive a close-then-reopen (see ShouldClearSearchOnOpen in
+    // starthook.h). This runs before GetStartRect() below so the very
+    // first frame of the open animation already reflects the
+    // no-search-box height, instead of opening tall and snapping down.
+    if (ShouldClearSearchOnOpen())
+    {
+        g_searchText.clear();
+        g_searchSelection.Reset();
+        ClearSearchResults();
+    }
+
     RefreshSystemColors();
 
     LoadQuickTools();
@@ -6156,6 +9276,8 @@ static void ShowStart()
 
     g_hover = -1;
     g_powerHover = -1;
+
+    RepositionSearchPanel();
 
     InvalidateRect(
         g_start,
@@ -6540,50 +9662,37 @@ static LRESULT CALLBACK KeyboardProc(
             return 1;
         }
 
+        bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+        if (vk == VK_LEFT || vk == VK_RIGHT ||
+            vk == VK_HOME || vk == VK_END ||
+            ((vk == 'A' || vk == 'C') && ctrl))
+        {
+            if (HandleSearchBoxNavigationKey(g_start, vk, ctrl, shift))
+                return 1;
+        }
+
         if (vk == VK_BACK)
         {
-            if (!g_searchText.empty())
-            {
-                g_searchText.pop_back();
-
-                if (g_searchText.empty())
-                {
-                    ResizeStartToContent(
-                        g_start);
-                }
-
-                InvalidateRect(
-                    g_start,
-                    nullptr,
-                    FALSE);
-            }
-
+            DeleteSearchSelectionOrCharBefore(g_start);
             return 1;
         }
 
-        if (IsPrintableKey(vk))
+        if (vk == VK_DELETE)
+        {
+            DeleteSearchSelectionOrCharAfter(g_start);
+            return 1;
+        }
+
+        if (!ctrl && IsPrintableKey(vk))
         {
             wchar_t c =
                 VirtualKeyToChar(vk);
 
             if (c >= 32)
             {
-                bool wasEmpty =
-                    g_searchText.empty();
-
-                g_searchText += c;
-
-                if (wasEmpty)
-                {
-                    ResizeStartToContent(
-                        g_start);
-                }
-
-                InvalidateRect(
-                    g_start,
-                    nullptr,
-                    FALSE);
-
+                InsertSearchChar(g_start, c);
                 return 1;
             }
         }
@@ -6687,15 +9796,41 @@ static LRESULT CALLBACK MouseProc(
                 }
 
                 // Any click (left, right, or middle) landing outside
-                // the menu while it's open dismisses it.
+                // the menu while it's open dismisses it — except inside
+                // the search results panel or the hover-preview panel
+                // (both separate windows sitting beside the menu by
+                // design), which handle their own clicks and shouldn't
+                // read as "clicked away."
                 if (g_startVisible)
                 {
                     RECT r =
                         GetStartRect();
 
+                    bool insideSatellite = false;
+
+                    if (g_searchPanel &&
+                        IsWindowVisible(g_searchPanel))
+                    {
+                        RECT panelRect{};
+
+                        if (GetWindowRect(g_searchPanel, &panelRect))
+                            insideSatellite = PtInRect(&panelRect, point) != FALSE;
+                    }
+
+                    if (!insideSatellite &&
+                        g_preview &&
+                        IsWindowVisible(g_preview))
+                    {
+                        RECT previewRect{};
+
+                        if (GetWindowRect(g_preview, &previewRect))
+                            insideSatellite = PtInRect(&previewRect, point) != FALSE;
+                    }
+
                     if (!PtInRect(
                             &r,
-                            point))
+                            point) &&
+                        !insideSatellite)
                     {
                         CloseStart();
                     }
@@ -6892,6 +10027,15 @@ int WINAPI wWinMain(
         return 1;
     }
 
+    // Non-fatal if either of these fails — the app is fully usable
+    // without live search results/God Mode, it just silently goes
+    // without them (the search box still resolves typed commands as
+    // before via HandleSearchEnter's ExecuteSmartInput fallback).
+    CreateSearchPanelWindow(instance);
+    CreatePreviewWindow(instance);
+    StartBackgroundIndexing();
+    StartGodModeIndexing();
+
     g_keyboardHook =
         SetWindowsHookExW(
             WH_KEYBOARD_LL,
@@ -7021,6 +10165,24 @@ int WINAPI wWinMain(
             g_start);
 
         g_start = nullptr;
+    }
+
+    if (g_searchPanel)
+    {
+        DestroyWindow(
+            g_searchPanel);
+
+        g_searchPanel = nullptr;
+    }
+
+    if (g_preview)
+    {
+        ClearPreviewContent();
+
+        DestroyWindow(
+            g_preview);
+
+        g_preview = nullptr;
     }
 
     DestroyIcons();

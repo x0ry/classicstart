@@ -7,6 +7,19 @@
 #include "../starthook.h"
 
 // ------------------------------------------------------------------
+// ShouldClearSearchOnOpen
+// ------------------------------------------------------------------
+
+TEST(SearchAlwaysClearsOnFreshOpen)
+{
+    // Regression guard for stale search text/results (including the God
+    // Mode Control Panel listing) surviving a close-then-reopen instead
+    // of the menu starting clean every time, the same way the native
+    // Start menu does.
+    CHECK(ShouldClearSearchOnOpen());
+}
+
+// ------------------------------------------------------------------
 // WinKeyTracker
 // ------------------------------------------------------------------
 
@@ -218,4 +231,434 @@ TEST(UpWithoutPriorDown_DoesNotSwallow)
     StartButtonMouseTracker tracker;
 
     CHECK(!tracker.OnLeftButtonUp());
+}
+
+// ------------------------------------------------------------------
+// MatchesSearchQuery / IsWildcardQuery
+// ------------------------------------------------------------------
+
+TEST(WildcardQuery_Detected)
+{
+    CHECK(IsWildcardQuery(L"*.txt"));
+    CHECK(IsWildcardQuery(L"report.?"));
+    CHECK(!IsWildcardQuery(L"report"));
+}
+
+TEST(WildcardPattern_MatchesExtension)
+{
+    bool hit =
+        MatchesSearchQuery(
+            L"report.txt",
+            L"report.txt",
+            L"*.txt",
+            L"*.txt");
+
+    CHECK(hit);
+}
+
+TEST(WildcardPattern_MissesWrongExtension)
+{
+    bool hit =
+        MatchesSearchQuery(
+            L"report.txt",
+            L"report.txt",
+            L"*.csv",
+            L"*.csv");
+
+    CHECK(!hit);
+}
+
+TEST(ContainsQuery_MatchesSubstring)
+{
+    bool hit =
+        MatchesSearchQuery(
+            L"Quarterly Report.txt",
+            L"quarterly report.txt",
+            L"report",
+            L"report");
+
+    CHECK(hit);
+}
+
+TEST(ContainsQuery_MissesUnrelatedName)
+{
+    bool hit =
+        MatchesSearchQuery(
+            L"budget.xlsx",
+            L"budget.xlsx",
+            L"report",
+            L"report");
+
+    CHECK(!hit);
+}
+
+TEST(ShortQuery_NeverMatches)
+{
+    bool hit =
+        MatchesSearchQuery(
+            L"report.txt",
+            L"report.txt",
+            L"r",
+            L"r");
+
+    CHECK(!hit);
+}
+
+TEST(EmptyQuery_NeverMatches)
+{
+    bool hit =
+        MatchesSearchQuery(
+            L"report.txt",
+            L"report.txt",
+            L"",
+            L"");
+
+    CHECK(!hit);
+}
+
+// ------------------------------------------------------------------
+// ClampPreviewTextSize / ScalePreviewImageSize
+// ------------------------------------------------------------------
+
+TEST(PreviewTextSize_ClampsSmallContentToMinimum)
+{
+    SIZE size =
+        ClampPreviewTextSize(
+            10, 10,
+            1920, 1080);
+
+    CHECK(size.cx >= (int)(1920 * 0.20));
+    CHECK(size.cy >= (int)(1080 * 0.12));
+}
+
+TEST(PreviewTextSize_ClampsLargeContentToMaximum)
+{
+    SIZE size =
+        ClampPreviewTextSize(
+            10000, 10000,
+            1920, 1080);
+
+    CHECK(size.cx <= (int)(1920 * 0.60));
+    CHECK(size.cy <= (int)(1080 * 0.65));
+}
+
+TEST(PreviewImageSize_TargetsQuarterScreenArea)
+{
+    SIZE size =
+        ScalePreviewImageSize(
+            1000, 1000,
+            1920, 1080);
+
+    double area = (double)size.cx * size.cy;
+    double target = 1920.0 * 1080.0 * 0.25;
+
+    // Allow slack for the integer rounding in the scale/shrink math.
+    CHECK(area > target * 0.7);
+    CHECK(area < target * 1.3);
+}
+
+TEST(PreviewImageSize_ClampsToWorkAreaFraction)
+{
+    // A very wide, short source image shouldn't blow past the 80%
+    // work-area width clamp even though it easily hits the target area.
+    SIZE size =
+        ScalePreviewImageSize(
+            10000, 10,
+            1920, 1080);
+
+    CHECK(size.cx <= (int)(1920 * 0.80));
+}
+
+TEST(PreviewImageSize_FloorsTinySourceImage)
+{
+    SIZE size =
+        ScalePreviewImageSize(
+            4, 4,
+            1920, 1080);
+
+    CHECK(size.cx >= 60);
+    CHECK(size.cy >= 60);
+}
+
+// ------------------------------------------------------------------
+// PreviewTextTargetWidth
+// ------------------------------------------------------------------
+
+TEST(PreviewTextWidth_ScalesWithWorkArea)
+{
+    int narrow = PreviewTextTargetWidth(1000, 100, 2000);
+    int wide = PreviewTextTargetWidth(2000, 100, 2000);
+
+    CHECK(wide > narrow);
+}
+
+TEST(PreviewTextWidth_ClampsToMinimumOnTinyScreen)
+{
+    int w = PreviewTextTargetWidth(400, 300, 560);
+
+    CHECK(w == 300);
+}
+
+TEST(PreviewTextWidth_ClampsToMaximumOnHugeScreen)
+{
+    int w = PreviewTextTargetWidth(10000, 300, 560);
+
+    CHECK(w == 560);
+}
+
+// ------------------------------------------------------------------
+// TextSelection
+// ------------------------------------------------------------------
+
+TEST(FreshSelection_HasNoSelectionAndCaretAtStart)
+{
+    TextSelection sel;
+
+    CHECK(!sel.HasSelection());
+    CHECK(sel.Caret() == 0);
+}
+
+TEST(PlaceCaretWithoutExtend_MovesCaretNoSelection)
+{
+    TextSelection sel;
+
+    sel.PlaceCaret(5, false);
+
+    CHECK(sel.Caret() == 5);
+    CHECK(!sel.HasSelection());
+}
+
+TEST(PlaceCaretWithExtend_StartsSelectionFromPriorCaret)
+{
+    TextSelection sel;
+
+    sel.PlaceCaret(3, false);
+    sel.PlaceCaret(7, true);
+
+    CHECK(sel.HasSelection());
+    CHECK(sel.SelectionStart() == 3);
+    CHECK(sel.SelectionEnd() == 7);
+}
+
+TEST(PlaceCaretWithExtend_CanSelectBackward)
+{
+    TextSelection sel;
+
+    sel.PlaceCaret(7, false);
+    sel.PlaceCaret(3, true);
+
+    CHECK(sel.HasSelection());
+    CHECK(sel.SelectionStart() == 3);
+    CHECK(sel.SelectionEnd() == 7);
+}
+
+TEST(MoveLeftWithoutSelection_MovesCaretBackOne)
+{
+    TextSelection sel;
+
+    sel.PlaceCaret(5, false);
+    sel.MoveLeft(false);
+
+    CHECK(sel.Caret() == 4);
+    CHECK(!sel.HasSelection());
+}
+
+TEST(MoveLeftAtStart_StaysAtZero)
+{
+    TextSelection sel;
+
+    sel.MoveLeft(false);
+
+    CHECK(sel.Caret() == 0);
+}
+
+TEST(MoveRightWithoutSelection_MovesCaretForwardOne)
+{
+    TextSelection sel;
+
+    sel.MoveRight(false, 10);
+
+    CHECK(sel.Caret() == 1);
+}
+
+TEST(MoveRightAtEnd_ClampsToTextLength)
+{
+    TextSelection sel;
+
+    sel.PlaceCaret(10, false);
+    sel.MoveRight(false, 10);
+
+    CHECK(sel.Caret() == 10);
+}
+
+TEST(MoveLeftWithActiveSelection_CollapsesToSelectionStart)
+{
+    // Standard textbox behavior: pressing Left (no Shift) with an active
+    // selection collapses to the start of that selection, not one
+    // character left of wherever the caret happened to be.
+    TextSelection sel;
+
+    sel.PlaceCaret(3, false);
+    sel.PlaceCaret(8, true);
+
+    sel.MoveLeft(false);
+
+    CHECK(sel.Caret() == 3);
+    CHECK(!sel.HasSelection());
+}
+
+TEST(MoveRightWithActiveSelection_CollapsesToSelectionEnd)
+{
+    TextSelection sel;
+
+    sel.PlaceCaret(3, false);
+    sel.PlaceCaret(8, true);
+
+    sel.MoveRight(false, 20);
+
+    CHECK(sel.Caret() == 8);
+    CHECK(!sel.HasSelection());
+}
+
+TEST(ShiftLeftTwice_ExtendsSelectionByTwo)
+{
+    TextSelection sel;
+
+    sel.PlaceCaret(5, false);
+    sel.MoveLeft(true);
+    sel.MoveLeft(true);
+
+    CHECK(sel.HasSelection());
+    CHECK(sel.SelectionStart() == 3);
+    CHECK(sel.SelectionEnd() == 5);
+}
+
+TEST(SelectAll_SelectsEntireRange)
+{
+    TextSelection sel;
+
+    sel.PlaceCaret(4, false);
+    sel.SelectAll(12);
+
+    CHECK(sel.HasSelection());
+    CHECK(sel.SelectionStart() == 0);
+    CHECK(sel.SelectionEnd() == 12);
+}
+
+TEST(MoveHomeAndEnd_JumpToBoundaries)
+{
+    TextSelection sel;
+
+    sel.PlaceCaret(5, false);
+
+    sel.MoveHome(false);
+    CHECK(sel.Caret() == 0);
+
+    sel.MoveEnd(false, 9);
+    CHECK(sel.Caret() == 9);
+}
+
+TEST(ClampTo_PullsCaretAndAnchorInsideShrunkText)
+{
+    TextSelection sel;
+
+    sel.PlaceCaret(2, false);
+    sel.PlaceCaret(9, true);
+
+    sel.ClampTo(5);
+
+    CHECK(sel.Caret() == 5);
+    CHECK(sel.SelectionEnd() == 5);
+}
+
+TEST(Reset_ClearsCaretAndSelection)
+{
+    TextSelection sel;
+
+    sel.PlaceCaret(3, false);
+    sel.PlaceCaret(8, true);
+
+    sel.Reset();
+
+    CHECK(sel.Caret() == 0);
+    CHECK(!sel.HasSelection());
+}
+
+// ------------------------------------------------------------------
+// FindWordBoundsAt
+// ------------------------------------------------------------------
+
+TEST(DoubleClickMiddleOfWord_SelectsWholeWord)
+{
+    // "hello world" — clicking inside "hello" (index 2, the 'l') should
+    // select the whole word, indices [0, 5).
+    int start = 0, end = 0;
+
+    FindWordBoundsAt(L"hello world", 2, start, end);
+
+    CHECK(start == 0);
+    CHECK(end == 5);
+}
+
+TEST(DoubleClickSecondWord_SelectsThatWord)
+{
+    int start = 0, end = 0;
+
+    FindWordBoundsAt(L"hello world", 7, start, end);
+
+    CHECK(start == 6);
+    CHECK(end == 11);
+}
+
+TEST(DoubleClickOnUnderscore_TreatsUnderscoreAsWordChar)
+{
+    int start = 0, end = 0;
+
+    FindWordBoundsAt(L"foo_bar baz", 3, start, end);
+
+    CHECK(start == 0);
+    CHECK(end == 7);
+}
+
+TEST(DoubleClickOnPunctuationRun_SelectsThatRun)
+{
+    // "a---b" — clicking in the dashes selects the whole punctuation
+    // run, not the nearest word, matching the classic text-box
+    // convention of grouping same-class runs together.
+    int start = 0, end = 0;
+
+    FindWordBoundsAt(L"a---b", 2, start, end);
+
+    CHECK(start == 1);
+    CHECK(end == 4);
+}
+
+TEST(DoubleClickSingleCharWord_SelectsJustThatChar)
+{
+    int start = 0, end = 0;
+
+    FindWordBoundsAt(L"a b c", 2, start, end);
+
+    CHECK(start == 2);
+    CHECK(end == 3);
+}
+
+TEST(FindWordBounds_EmptyText_ReturnsEmptyRange)
+{
+    int start = 5, end = 5;
+
+    FindWordBoundsAt(L"", 0, start, end);
+
+    CHECK(start == 0);
+    CHECK(end == 0);
+}
+
+TEST(FindWordBounds_PositionPastEnd_ClampsToLastChar)
+{
+    int start = 0, end = 0;
+
+    FindWordBoundsAt(L"hello", 99, start, end);
+
+    CHECK(start == 0);
+    CHECK(end == 5);
 }
